@@ -9,7 +9,6 @@ import { search, searchKeymap } from '@codemirror/search';
 import { autocompletion, CompletionContext } from '@codemirror/autocomplete';
 import { toggleComment } from '@codemirror/commands';
 import { foldGutter, foldKeymap, indentOnInput } from '@codemirror/language';
-import { showMinimap } from '@replit/codemirror-minimap';
 import { GlobalWorkerOptions, getDocument, renderTextLayer } from 'pdfjs-dist';
 import pdfWorker from 'pdfjs-dist/build/pdf.worker.min?url';
 import 'pdfjs-dist/web/pdf_viewer.css';
@@ -995,6 +994,7 @@ export default function EditorPage() {
   const [plotTitle, setPlotTitle] = useState('');
   const [plotFilename, setPlotFilename] = useState('');
   const [plotPrompt, setPlotPrompt] = useState('');
+  const [plotRetries, setPlotRetries] = useState(2);
   const [plotBusy, setPlotBusy] = useState(false);
   const [plotStatus, setPlotStatus] = useState('');
   const [plotAssetPath, setPlotAssetPath] = useState('');
@@ -1237,7 +1237,6 @@ export default function EditorPage() {
         ghostField,
         search(),
         autocompletion({ override: [latexCompletionSource] }),
-        showMinimap.of({}),
         updateListener,
         keymapExtension
       ]
@@ -1868,6 +1867,7 @@ export default function EditorPage() {
         title: plotTitle.trim() || undefined,
         prompt: plotPrompt.trim() || undefined,
         filename: plotFilename.trim() || undefined,
+        retries: plotRetries,
         llmConfig
       });
       if (!res.ok || !res.assetPath) {
@@ -4101,6 +4101,17 @@ export default function EditorPage() {
                         onChange={(event) => setPlotPrompt(event.target.value)}
                         placeholder="例如：使用折线图，突出 Method A；加上 legend；设置 y 轴为 Accuracy"
                         rows={2}
+                      />
+                    </div>
+                    <div className="field">
+                      <label>Debug 重试次数</label>
+                      <input
+                        className="input"
+                        type="number"
+                        min={0}
+                        max={5}
+                        value={plotRetries}
+                        onChange={(event) => setPlotRetries(Math.max(0, Math.min(5, Number(event.target.value) || 0)))}
                       />
                     </div>
                     <label className="checkbox-row">

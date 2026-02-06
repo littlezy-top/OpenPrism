@@ -1174,14 +1174,6 @@ body {
   outline: none;
 }
 
-.cm-minimap {
-  opacity: 0.6;
-  transition: opacity 0.2s ease;
-}
-
-.cm-minimap:hover {
-  opacity: 1;
-}
 
 .cm-ghost {
   color: rgba(120, 98, 83, 0.6);

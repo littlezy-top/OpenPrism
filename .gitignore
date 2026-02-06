@@ -6,3 +6,5 @@ apps/frontend/dist/
 apps/frontend/.vite/
 apps/backend/.cache/
 data/
+
+OpenPrism/AGENTS.md

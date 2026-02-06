@@ -206,6 +206,7 @@ export function plotFromTable(payload: {
   title?: string;
   prompt?: string;
   filename?: string;
+  retries?: number;
   llmConfig?: Partial<LLMConfig>;
 }) {
   return request<{ ok: boolean; assetPath?: string; error?: string }>(

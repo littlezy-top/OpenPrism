@@ -4,6 +4,12 @@ import { promises as fs } from 'fs';
 import { spawn } from 'child_process';
 import { ensureDir } from '../utils/fsUtils.js';
 
+function resolvePythonExecutable() {
+  if (process.env.OPENPRISM_PYTHON) return process.env.OPENPRISM_PYTHON;
+  if (process.env.CONDA_PREFIX) return `${process.env.CONDA_PREFIX}/bin/python`;
+  return 'python3';
+}
+
 export async function runPythonPlot(payload) {
   const runId = crypto.randomUUID();
   const tmpDir = path.join('/tmp', `openprism_plot_${runId}`);
@@ -39,10 +45,23 @@ def parse_table(latex):
     for row in rows:
         if row.strip().startswith('%'):
             continue
-        cells = [c.strip() for c in row.split('&')]
-        if len(cells) == 1 and cells[0] == '':
+        # split on unescaped &
+        raw_cells = [c.strip() for c in re.split(r'(?<!\\\\)&', row)]
+        if len(raw_cells) == 1 and raw_cells[0] == '':
             continue
-        data.append(cells)
+        expanded = []
+        for cell in raw_cells:
+            m = re.match(r'\\\\multicolumn\\{(\\d+)\\}\\{[^}]*\\}\\{(.+)\\}', cell)
+            if m:
+                span = int(m.group(1))
+                content = m.group(2).strip()
+                expanded.append(content)
+                for _ in range(span - 1):
+                    expanded.append('')
+            else:
+                m2 = re.match(r'\\\\multirow\\{[^}]*\\}\\{[^}]*\\}\\{(.+)\\}', cell)
+                expanded.append(m2.group(1).strip() if m2 else cell)
+        data.append(expanded)
     return data
 
 
@@ -82,79 +101,35 @@ data = parse_table(latex)
 if not data:
     raise RuntimeError('No table rows parsed')
 
+max_cols = max(len(r) for r in data)
 if all(not is_number(c) for c in data[0]):
     header = data[0]
     rows = data[1:]
 else:
-    header = [f'col{i+1}' for i in range(len(data[0]))]
+    header = [f'col{i+1}' for i in range(max_cols)]
     rows = data
+
+if len(header) < max_cols:
+    header = header + [f'col{i+1}' for i in range(len(header), max_cols)]
+elif len(header) > max_cols:
+    header = header[:max_cols]
 
 if not rows:
     raise RuntimeError('No data rows after header')
 
+rows = [(r + [''] * (max_cols - len(r)))[:max_cols] for r in rows]
+
 plt.figure(figsize=(6, 4))
-if plot_code and HAS_PANDAS and HAS_SEABORN:
+df = None
+df_numeric = None
+if HAS_PANDAS:
     df = pd.DataFrame(rows, columns=header)
-    df_numeric = df.copy()
-    for col in df_numeric.columns:
-        df_numeric[col] = pd.to_numeric(df_numeric[col], errors='coerce')
-    exec(plot_code, {"df": df, "df_numeric": df_numeric, "sns": sns, "plt": plt})
-else:
-    # Fallback: matplotlib-only
-    numeric_cols = []
-    for i in range(len(header)):
-        if any(i < len(r) and is_number(r[i]) for r in rows):
-            numeric_cols.append(i)
-    if not numeric_cols:
-        raise RuntimeError('No numeric columns for plotting')
+    df_numeric = df.apply(lambda col: pd.to_numeric(col, errors='coerce'))
 
-    label_col = None
-    if 0 not in numeric_cols and len(header) > 1:
-        label_col = 0
-    x_labels = [r[label_col] if label_col is not None and len(r) > label_col else str(idx) for idx, r in enumerate(rows)]
-    value_cols = [i for i in numeric_cols if i != label_col]
-    if not value_cols:
-        value_cols = numeric_cols
+if not plot_code:
+    raise RuntimeError('Missing plot code')
 
-    x_positions = list(range(len(rows)))
-    series = []
-    for col in value_cols:
-        y_vals = []
-        for r in rows:
-            if col < len(r) and is_number(r[col]):
-                y_vals.append(float(r[col]))
-            else:
-                y_vals.append(0.0)
-        series.append((header[col] if col < len(header) else f'col{col+1}', y_vals))
-
-    if chart_type == 'heatmap':
-        matrix = []
-        for r in rows:
-            row_vals = []
-            for col in value_cols:
-                if col < len(r) and is_number(r[col]):
-                    row_vals.append(float(r[col]))
-                else:
-                    row_vals.append(0.0)
-            matrix.append(row_vals)
-        plt.imshow(matrix, aspect='auto', cmap='viridis')
-        plt.xticks(range(len(value_cols)), [header[c] for c in value_cols], rotation=30, ha='right')
-        plt.yticks(range(len(rows)), x_labels)
-    elif chart_type == 'line':
-        for idx, (label, y_vals) in enumerate(series):
-            plt.plot(x_positions, y_vals, marker='o', label=label)
-        plt.xticks(x_positions, x_labels, rotation=30, ha='right')
-        if len(series) > 1:
-            plt.legend()
-    else:
-        width = 0.8 / max(1, len(series))
-        for idx, (label, y_vals) in enumerate(series):
-            offset = (idx - (len(series) - 1) / 2) * width
-            positions = [x + offset for x in x_positions]
-            plt.bar(positions, y_vals, width=width, label=label)
-        plt.xticks(x_positions, x_labels, rotation=30, ha='right')
-        if len(series) > 1:
-            plt.legend()
+exec(plot_code, {"df": df, "df_numeric": df_numeric, "rows": rows, "header": header, "sns": sns, "plt": plt})
 
 if title:
     plt.title(title)
@@ -166,7 +141,8 @@ plt.savefig(output_path, dpi=150)
   await fs.writeFile(scriptPath, pythonScript, 'utf8');
 
   return new Promise((resolve) => {
-    const proc = spawn('python3', [scriptPath, payloadPath], { cwd: tmpDir });
+    const pythonBin = resolvePythonExecutable();
+    const proc = spawn(pythonBin, [scriptPath, payloadPath], { cwd: tmpDir });
     let stdout = '';
     let stderr = '';
     proc.stdout.on('data', (chunk) => {
@@ -178,7 +154,7 @@ plt.savefig(output_path, dpi=150)
     proc.on('close', async (code) => {
       await fs.rm(tmpDir, { recursive: true, force: true });
       if (code !== 0) {
-        resolve({ ok: false, error: stderr || stdout || `Python exited with ${code}` });
+        resolve({ ok: false, error: stderr || stdout || `Python exited with ${code} (${pythonBin})` });
         return;
       }
       resolve({ ok: true });

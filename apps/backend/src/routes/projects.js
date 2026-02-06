@@ -11,6 +11,7 @@ import { isTextFile, extractDocumentBody, mergeTemplateBody } from '../utils/tex
 import { readTemplateManifest, copyTemplateIntoProject } from '../services/templateService.js';
 import { getProjectRoot } from '../services/projectService.js';
 import { downloadArxivSource, extractArxivId } from '../services/arxivService.js';
+import { getLang, t } from '../i18n/index.js';
 
 export function registerProjectRoutes(fastify) {
   fastify.get('/api/projects', async () => {
@@ -46,6 +47,7 @@ export function registerProjectRoutes(fastify) {
   });
 
   fastify.post('/api/projects/import-zip', async (req) => {
+    const lang = getLang(req);
     await ensureDir(DATA_DIR);
     const id = crypto.randomUUID();
     const projectRoot = path.join(DATA_DIR, id);
@@ -81,7 +83,7 @@ export function registerProjectRoutes(fastify) {
       }
     } catch (err) {
       await fs.rm(projectRoot, { recursive: true, force: true });
-      return { ok: false, error: `Zip 解压失败: ${String(err)}` };
+      return { ok: false, error: t(lang, 'zip_extract_failed', { error: String(err) }) };
     }
 
     if (!hasZip) {
@@ -93,11 +95,27 @@ export function registerProjectRoutes(fastify) {
     return { ok: true, project: meta };
   });
 
-  fastify.post('/api/projects/import-arxiv', async (req) => {
+  fastify.get('/api/projects/import-arxiv-sse', async (req, reply) => {
+    const lang = getLang(req);
     await ensureDir(DATA_DIR);
-    const { arxivIdOrUrl, projectName } = req.body || {};
+    const { arxivIdOrUrl, projectName } = req.query;
     const arxivId = extractArxivId(arxivIdOrUrl);
-    if (!arxivId) return { ok: false, error: 'Invalid arXiv ID.' };
+    req.log.info({ arxivId, arxivIdOrUrl }, 'import-arxiv-sse: parsed id');
+
+    reply.raw.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive'
+    });
+    const send = (event, data) => {
+      reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+
+    if (!arxivId) {
+      send('error', { error: 'Invalid arXiv ID.' });
+      reply.raw.end();
+      return reply;
+    }
 
     const id = crypto.randomUUID();
     const projectRoot = path.join(DATA_DIR, id);
@@ -110,7 +128,13 @@ export function registerProjectRoutes(fastify) {
 
     const tmpTar = path.join(projectRoot, '__arxiv_source.tar.gz');
     try {
-      await downloadArxivSource(arxivId, tmpTar);
+      send('progress', { phase: 'download', percent: 0 });
+      await downloadArxivSource(arxivId, tmpTar, ({ received, total }) => {
+        const percent = total > 0 ? Math.round((received / total) * 100) : -1;
+        send('progress', { phase: 'download', percent, received, total });
+      });
+
+      send('progress', { phase: 'extract', percent: -1 });
       await tar.x({
         file: tmpTar,
         cwd: projectRoot,
@@ -122,13 +146,17 @@ export function registerProjectRoutes(fastify) {
       });
     } catch (err) {
       await fs.rm(projectRoot, { recursive: true, force: true });
-      return { ok: false, error: `arXiv 下载失败: ${String(err)}` };
+      send('error', { error: t(lang, 'arxiv_download_failed', { error: String(err) }) });
+      reply.raw.end();
+      return reply;
     } finally {
       await fs.rm(tmpTar, { force: true });
     }
 
     await writeJson(path.join(projectRoot, 'project.json'), meta);
-    return { ok: true, project: meta };
+    send('done', { ok: true, project: meta });
+    reply.raw.end();
+    return reply;
   });
 
   fastify.post('/api/projects/:id/rename-project', async (req) => {

@@ -1,8 +1,10 @@
 import { callOpenAICompatible } from '../services/llmService.js';
 import { runToolAgent } from '../services/agentService.js';
+import { getLang, t } from '../i18n/index.js';
 
 export function registerAgentRoutes(fastify) {
   fastify.post('/api/agent/run', async (req) => {
+    const lang = getLang(req);
     const {
       task = 'polish',
       prompt = '',
@@ -43,8 +45,7 @@ export function registerAgentRoutes(fastify) {
       if (!result.ok) {
         return {
           ok: false,
-          reply: `LLM 未配置或调用失败：${result.error || 'unknown error'}` +
-            '。你可以在前端设置里填写 API Key/Endpoint，或配置 OPENPRISM_LLM_* 环境变量。',
+          reply: t(lang, 'llm_error', { error: result.error || 'unknown error' }),
           suggestion: ''
         };
       }
@@ -53,7 +54,7 @@ export function registerAgentRoutes(fastify) {
     }
 
     if (mode === 'tools') {
-      return runToolAgent({ projectId, activePath, task, prompt, selection, compileLog, llmConfig });
+      return runToolAgent({ projectId, activePath, task, prompt, selection, compileLog, llmConfig, lang });
     }
 
     const system =
@@ -91,8 +92,7 @@ export function registerAgentRoutes(fastify) {
     if (!result.ok) {
       return {
         ok: false,
-        reply: `LLM 未配置或调用失败：${result.error || 'unknown error'}` +
-          '。你可以在前端设置里填写 API Key/Endpoint，或配置 OPENPRISM_LLM_* 环境变量。',
+        reply: t(lang, 'llm_error', { error: result.error || 'unknown error' }),
         suggestion: ''
       };
     }

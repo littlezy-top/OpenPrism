@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, Dispatch, MouseEvent, SetStateAction, RefObject, DragEvent } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 import { basicSetup } from 'codemirror';
 import { latex } from '../latex/lang';
 import { EditorState, StateEffect, StateField } from '@codemirror/state';
@@ -8,7 +9,7 @@ import { Decoration, EditorView, DecorationSet, WidgetType, keymap } from '@code
 import { search, searchKeymap } from '@codemirror/search';
 import { autocompletion, CompletionContext } from '@codemirror/autocomplete';
 import { toggleComment } from '@codemirror/commands';
-import { foldGutter, foldKeymap, indentOnInput } from '@codemirror/language';
+import { foldGutter, foldKeymap, foldService, indentOnInput } from '@codemirror/language';
 import { GlobalWorkerOptions, getDocument, renderTextLayer } from 'pdfjs-dist';
 import pdfWorker from 'pdfjs-dist/build/pdf.worker.min?url';
 import 'pdfjs-dist/web/pdf_viewer.css';
@@ -32,7 +33,7 @@ import {
 } from '../api/client';
 import type { ArxivPaper } from '../api/client';
 import { createTwoFilesPatch, diffLines } from 'diff';
-import { createLatexEngine, LatexEngine, CompileOutcome } from '../latex/engine';
+import type { CompileOutcome } from '../latex/engine';
 
 GlobalWorkerOptions.workerSrc = pdfWorker;
 
@@ -61,10 +62,9 @@ type InlineEdit =
   | { kind: 'new-file' | 'new-folder'; parent: string; value: string }
   | { kind: 'rename'; path: string; value: string };
 
-type CompileEngine = 'swiftlatex' | 'tectonic' | 'auto';
+type CompileEngine = 'pdflatex' | 'xelatex' | 'lualatex' | 'latexmk' | 'tectonic';
 
 type AppSettings = {
-  texliveEndpoint: string;
   llmEndpoint: string;
   llmApiKey: string;
   llmModel: string;
@@ -77,18 +77,17 @@ type AppSettings = {
   compileEngine: CompileEngine;
 };
 
-const DEFAULT_TASKS = [
-  { value: 'polish', label: '润色' },
-  { value: 'rewrite', label: '改写' },
-  { value: 'structure', label: '结构调整' },
-  { value: 'translate', label: '翻译' },
-  { value: 'websearch', label: '检索 (arXiv)' },
-  { value: 'custom', label: '自定义' }
+const DEFAULT_TASKS = (t: (key: string) => string) => [
+  { value: 'polish', label: t('润色') },
+  { value: 'rewrite', label: t('改写') },
+  { value: 'structure', label: t('结构调整') },
+  { value: 'translate', label: t('翻译') },
+  { value: 'websearch', label: t('检索 (arXiv)') },
+  { value: 'custom', label: t('自定义') }
 ];
 
 const SETTINGS_KEY = 'openprism-settings-v1';
 const DEFAULT_SETTINGS: AppSettings = {
-  texliveEndpoint: 'https://texlive.swiftlatex.com',
   llmEndpoint: 'https://api.openai.com/v1/chat/completions',
   llmApiKey: '',
   llmModel: 'gpt-4o-mini',
@@ -98,7 +97,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   visionEndpoint: '',
   visionApiKey: '',
   visionModel: '',
-  compileEngine: 'swiftlatex'
+  compileEngine: 'pdflatex'
 };
 
 function loadSettings(): AppSettings {
@@ -108,9 +107,10 @@ function loadSettings(): AppSettings {
     if (!raw) return DEFAULT_SETTINGS;
     const parsed = JSON.parse(raw) as Partial<AppSettings>;
     const engine = parsed.compileEngine;
+    const VALID_ENGINES: CompileEngine[] = ['pdflatex', 'xelatex', 'lualatex', 'latexmk', 'tectonic'];
     const compileEngine: CompileEngine =
-      engine === 'swiftlatex' || engine === 'tectonic' || engine === 'auto'
-        ? engine
+      VALID_ENGINES.includes(engine as CompileEngine)
+        ? (engine as CompileEngine)
         : DEFAULT_SETTINGS.compileEngine;
     return {
       ...DEFAULT_SETTINGS,
@@ -133,6 +133,176 @@ function persistSettings(settings: AppSettings) {
 
 const FIGURE_EXTS = ['.png', '.jpg', '.jpeg', '.pdf', '.svg', '.eps'];
 const TEXT_EXTS = ['.sty', '.cls', '.bst', '.txt', '.md', '.json', '.yaml', '.yml', '.csv', '.tsv'];
+
+const SECTION_LEVELS: Record<string, number> = {
+  section: 1,
+  subsection: 2,
+  subsubsection: 3,
+  paragraph: 4,
+  subparagraph: 5
+};
+
+const SECTION_RE = /\\(section|subsection|subsubsection|paragraph|subparagraph)\*?\b/;
+const ENV_RE = /\\(begin|end)\{([^}]+)\}/g;
+const IF_START_RE = /\\if[a-zA-Z@]*\b/g;
+const IF_END_RE = /\\fi\b/g;
+const IF_START_TEST = /\\if[a-zA-Z@]*\b/;
+const GROUP_START_RE = /\\begingroup\b/g;
+const GROUP_END_RE = /\\endgroup\b/g;
+const GROUP_START_TEST = /\\begingroup\b/;
+
+function stripLatexComment(text: string) {
+  let result = '';
+  let escaped = false;
+  for (const ch of text) {
+    if (ch === '%' && !escaped) break;
+    result += ch;
+    if (ch === '\\' && !escaped) {
+      escaped = true;
+    } else {
+      escaped = false;
+    }
+  }
+  return result;
+}
+
+function findEnvFold(state: EditorState, startLineNumber: number, lineEnd: number, env: string) {
+  let depth = 1;
+  for (let lineNo = startLineNumber + 1; lineNo <= state.doc.lines; lineNo += 1) {
+    const line = state.doc.line(lineNo);
+    const clean = stripLatexComment(line.text);
+    let match: RegExpExecArray | null;
+    ENV_RE.lastIndex = 0;
+    while ((match = ENV_RE.exec(clean)) !== null) {
+      const kind = match[1];
+      const name = match[2];
+      if (name !== env) continue;
+      if (kind === 'begin') depth += 1;
+      if (kind === 'end') depth -= 1;
+      if (depth === 0) {
+        if (line.from > lineEnd) {
+          return { from: lineEnd, to: line.from };
+        }
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+function findSectionFold(state: EditorState, startLineNumber: number, lineEnd: number, level: number) {
+  for (let lineNo = startLineNumber + 1; lineNo <= state.doc.lines; lineNo += 1) {
+    const line = state.doc.line(lineNo);
+    const clean = stripLatexComment(line.text);
+    const match = clean.match(SECTION_RE);
+    if (!match) continue;
+    const nextLevel = SECTION_LEVELS[match[1]] ?? 99;
+    if (nextLevel <= level) {
+      if (line.from > lineEnd) {
+        return { from: lineEnd, to: line.from };
+      }
+      return null;
+    }
+  }
+  if (state.doc.length > lineEnd) {
+    return { from: lineEnd, to: state.doc.length };
+  }
+  return null;
+}
+
+function countRegex(text: string, re: RegExp) {
+  let count = 0;
+  let match: RegExpExecArray | null;
+  re.lastIndex = 0;
+  while ((match = re.exec(text)) !== null) {
+    count += 1;
+  }
+  return count;
+}
+
+function countUnescapedToken(text: string, token: string) {
+  let count = 0;
+  for (let i = 0; i <= text.length - token.length; i += 1) {
+    if (text.slice(i, i + token.length) !== token) continue;
+    if (i > 0 && text[i - 1] === '\\') continue;
+    count += 1;
+    i += token.length - 1;
+  }
+  return count;
+}
+
+function findTokenFold(
+  state: EditorState,
+  startLineNumber: number,
+  lineEnd: number,
+  startRe: RegExp,
+  endRe: RegExp
+) {
+  let depth = 1;
+  for (let lineNo = startLineNumber + 1; lineNo <= state.doc.lines; lineNo += 1) {
+    const line = state.doc.line(lineNo);
+    const clean = stripLatexComment(line.text);
+    depth += countRegex(clean, startRe);
+    depth -= countRegex(clean, endRe);
+    if (depth <= 0) {
+      if (line.from > lineEnd) {
+        return { from: lineEnd, to: line.from };
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
+function findDisplayMathFold(
+  state: EditorState,
+  startLineNumber: number,
+  lineEnd: number,
+  startToken: string,
+  endToken: string
+) {
+  for (let lineNo = startLineNumber + 1; lineNo <= state.doc.lines; lineNo += 1) {
+    const line = state.doc.line(lineNo);
+    const clean = stripLatexComment(line.text);
+    if (countUnescapedToken(clean, endToken) > 0) {
+      if (line.from > lineEnd) {
+        return { from: lineEnd, to: line.from };
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
+function latexFoldService(state: EditorState, lineStart: number, lineEnd: number) {
+  const line = state.doc.lineAt(lineStart);
+  const clean = stripLatexComment(line.text);
+  if (!clean.trim()) return null;
+  const envMatch = clean.match(/\\begin\{([^}]+)\}/);
+  if (envMatch) {
+    return findEnvFold(state, line.number, lineEnd, envMatch[1]);
+  }
+  const sectionMatch = clean.match(SECTION_RE);
+  if (sectionMatch) {
+    const level = SECTION_LEVELS[sectionMatch[1]] ?? 99;
+    return findSectionFold(state, line.number, lineEnd, level);
+  }
+  if (GROUP_START_TEST.test(clean)) {
+    return findTokenFold(state, line.number, lineEnd, GROUP_START_RE, GROUP_END_RE);
+  }
+  if (IF_START_TEST.test(clean)) {
+    return findTokenFold(state, line.number, lineEnd, IF_START_RE, IF_END_RE);
+  }
+  const hasDisplayDollar = countUnescapedToken(clean, '$$') % 2 === 1;
+  if (hasDisplayDollar) {
+    return findDisplayMathFold(state, line.number, lineEnd, '$$', '$$');
+  }
+  const hasDisplayBracket = clean.includes('\\[');
+  if (hasDisplayBracket && !clean.includes('\\]')) {
+    return findDisplayMathFold(state, line.number, lineEnd, '\\[', '\\]');
+  }
+  return null;
+}
 
 function isFigureFile(path: string) {
   const lower = path.toLowerCase();
@@ -651,6 +821,7 @@ function replaceSelection(source: string, start: number, end: number, replacemen
 }
 
 function SplitDiffView({ rows }: { rows: ReturnType<typeof buildSplitDiff> }) {
+  const { t } = useTranslation();
   const leftRef = useRef<HTMLDivElement | null>(null);
   const rightRef = useRef<HTMLDivElement | null>(null);
   const lockRef = useRef(false);
@@ -672,7 +843,7 @@ function SplitDiffView({ rows }: { rows: ReturnType<typeof buildSplitDiff> }) {
         ref={leftRef}
         onScroll={() => syncScroll(leftRef.current, rightRef.current)}
       >
-        <div className="split-header">Before</div>
+        <div className="split-header">{t('Before')}</div>
         {rows.map((row, idx) => (
           <div key={`l-${idx}`} className={`split-row ${row.type}`}>
             <div className="line-no">{row.leftNo ?? ''}</div>
@@ -685,7 +856,7 @@ function SplitDiffView({ rows }: { rows: ReturnType<typeof buildSplitDiff> }) {
         ref={rightRef}
         onScroll={() => syncScroll(rightRef.current, leftRef.current)}
       >
-        <div className="split-header">After</div>
+        <div className="split-header">{t('After')}</div>
         {rows.map((row, idx) => (
           <div key={`r-${idx}`} className={`split-row ${row.type}`}>
             <div className="line-no">{row.rightNo ?? ''}</div>
@@ -722,6 +893,7 @@ function PdfPreview({
   onAddAnnotation?: (page: number, x: number, y: number) => void;
   containerRef?: RefObject<HTMLDivElement>;
 }) {
+  const { t } = useTranslation();
   const localRef = useRef<HTMLDivElement | null>(null);
   const containerRef = externalRef || localRef;
 
@@ -836,7 +1008,7 @@ function PdfPreview({
                 } catch {
                   pageNumber = undefined;
                 }
-                items.push({ title: entry.title || '(untitled)', page: pageNumber, level });
+                items.push({ title: entry.title || t('(untitled)'), page: pageNumber, level });
                 if (entry.items?.length) {
                   await walk(entry.items, level + 1);
                 }
@@ -850,19 +1022,19 @@ function PdfPreview({
         }
       } catch (err) {
         console.error('PDF render error:', err);
-        container.innerHTML = '<div class="muted">PDF 渲染失败</div>';
+        container.innerHTML = `<div class="muted">${t('PDF 渲染失败')}</div>`;
       }
     };
 
     render().catch(() => {
-      container.innerHTML = '<div class="muted">PDF 渲染失败</div>';
+      container.innerHTML = `<div class="muted">${t('PDF 渲染失败')}</div>`;
     });
 
     return () => {
       cancelled = true;
       container.innerHTML = '';
     };
-  }, [pdfUrl, fitWidth, onFitScale, scale, spread, onOutline]);
+  }, [pdfUrl, fitWidth, onFitScale, scale, spread, onOutline, t]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -910,6 +1082,7 @@ function PdfPreview({
 
 export default function EditorPage() {
   const navigate = useNavigate();
+  const { t, i18n } = useTranslation();
   const { projectId: routeProjectId } = useParams();
   const projectId = routeProjectId || '';
   const [settings, setSettings] = useState<AppSettings>(() => loadSettings());
@@ -928,7 +1101,7 @@ export default function EditorPage() {
   const [chatMessages, setChatMessages] = useState<Message[]>([]);
   const [agentMessages, setAgentMessages] = useState<Message[]>([]);
   const [prompt, setPrompt] = useState('');
-  const [task, setTask] = useState(DEFAULT_TASKS[0].value);
+  const [task, setTask] = useState(DEFAULT_TASKS(t)[0].value);
   const [mode, setMode] = useState<'direct' | 'tools'>('direct');
   const [translateScope, setTranslateScope] = useState<'selection' | 'file' | 'project'>('selection');
   const [translateTarget, setTranslateTarget] = useState('English');
@@ -1025,7 +1198,6 @@ export default function EditorPage() {
   const acceptChunkRef = useRef<() => void>(() => {});
   const clearSuggestionRef = useRef<() => void>(() => {});
   const saveActiveFileRef = useRef<() => void>(() => {});
-  const engineRef = useRef<LatexEngine | null>(null);
   const gridRef = useRef<HTMLDivElement | null>(null);
   const editorSplitRef = useRef<HTMLDivElement | null>(null);
   const pdfContainerRef = useRef<HTMLDivElement | null>(null);
@@ -1035,7 +1207,6 @@ export default function EditorPage() {
   const saveTimerRef = useRef<number | null>(null);
 
   const {
-    texliveEndpoint,
     llmEndpoint,
     llmApiKey,
     llmModel,
@@ -1051,11 +1222,6 @@ export default function EditorPage() {
   useEffect(() => {
     persistSettings(settings);
   }, [settings]);
-
-  useEffect(() => {
-    engineRef.current = null;
-    setEngineName('');
-  }, [texliveEndpoint]);
 
   const llmConfig = useMemo(
     () => ({
@@ -1094,13 +1260,13 @@ export default function EditorPage() {
       .then((res) => {
         const current = res.projects.find((item) => item.id === projectId);
         if (!current) {
-          setStatus('项目不存在或已被删除。');
+          setStatus(t('项目不存在或已被删除。'));
           return;
         }
         setProjectName(current.name);
       })
-      .catch((err) => setStatus(`加载项目信息失败: ${String(err)}`));
-  }, [navigate, projectId]);
+      .catch((err) => setStatus(t('加载项目信息失败: {{error}}', { error: String(err) })));
+  }, [navigate, projectId, t]);
 
   useEffect(() => {
     activePathRef.current = activePath;
@@ -1124,9 +1290,9 @@ export default function EditorPage() {
     if (!projectId) return;
     setFiles({});
     setActivePath('');
-    refreshTree(false).catch((err) => setStatus(`加载文件树失败: ${String(err)}`));
+    refreshTree(false).catch((err) => setStatus(t('加载文件树失败: {{error}}', { error: String(err) })));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId]);
+  }, [projectId, t]);
 
 
   useEffect(() => {
@@ -1232,6 +1398,7 @@ export default function EditorPage() {
         latex(),
         indentOnInput(),
         foldGutter(),
+        foldService.of(latexFoldService),
         EditorView.lineWrapping,
         editorTheme,
         ghostField,
@@ -1400,12 +1567,12 @@ export default function EditorPage() {
       const res = await runAgent({
         task: 'autocomplete',
         prompt: [
-          'You are a LaTeX writing assistant.',
-          'Continue after <CURSOR> with a coherent next block (1-2 paragraphs or a full environment).',
-          heading ? `Current section: ${heading.title} (${heading.level}).` : '',
-          env ? `You are inside environment: ${env}.` : '',
-          'Preserve style and formatting.',
-          'Return only the continuation text, no commentary.'
+          t('You are a LaTeX writing assistant.'),
+          t('Continue after <CURSOR> with a coherent next block (1-2 paragraphs or a full environment).'),
+          heading ? t('Current section: {{title}} ({{level}}).', { title: heading.title, level: heading.level }) : '',
+          env ? t('You are inside environment: {{env}}.', { env }) : '',
+          t('Preserve style and formatting.'),
+          t('Return only the continuation text, no commentary.')
         ].filter(Boolean).join(' '),
         selection: '',
         content: `${before}<CURSOR>${after}`,
@@ -1424,14 +1591,14 @@ export default function EditorPage() {
         effects: setGhostEffect.of({ pos, text: suggestion })
       });
     } catch (err) {
-      setStatus(`补全失败: ${String(err)}`);
+      setStatus(t('补全失败: {{error}}', { error: String(err) }));
     } finally {
       setIsSuggesting(false);
       if (!inlineSuggestionRef.current) {
         setSuggestionPos(null);
       }
     }
-  }, [activePath, clearInlineSuggestion, compileLog, isSuggesting, llmConfig, projectId, updateSuggestionPosition]);
+  }, [activePath, clearInlineSuggestion, compileLog, isSuggesting, llmConfig, projectId, updateSuggestionPosition, t]);
 
   useEffect(() => {
     if (!inlineSuggestionText) {
@@ -1479,15 +1646,15 @@ export default function EditorPage() {
         setSavePulse(true);
         window.setTimeout(() => setSavePulse(false), 1200);
         if (!opts?.silent) {
-          setStatus(`已保存 ${activePath}`);
+          setStatus(t('已保存 {{path}}', { path: activePath }));
         }
       } catch (err) {
-        setStatus(`保存失败: ${String(err)}`);
+        setStatus(t('保存失败: {{error}}', { error: String(err) }));
       } finally {
         setIsSaving(false);
       }
     },
-    [activePath, editorValue, projectId]
+    [activePath, editorValue, projectId, t]
   );
 
   useEffect(() => {
@@ -1623,7 +1790,7 @@ export default function EditorPage() {
       }
       const outline = parseOutline(content).slice(0, 12);
       const headings = outline.map((item) => `${'  '.repeat(item.level - 1)}- ${item.title}`);
-      summaries.push(`File: ${current}\n${headings.join('\n')}`);
+      summaries.push(t('File: {{file}}\n{{headings}}', { file: current, headings: headings.join('\n') }));
       const baseDir = getParentPath(current);
       const includes = extractIncludeTargets(content);
       includes.forEach((raw) => {
@@ -1638,8 +1805,8 @@ export default function EditorPage() {
       });
     }
     const filesList = Array.from(visited).join(', ');
-    return `Project files: ${filesList}\nOutline:\n${summaries.join('\n')}`;
-  }, [activePath, ensureFileContent, mainFile]);
+    return t('Project files: {{files}}\nOutline:\n{{summaries}}', { files: filesList, summaries: summaries.join('\n') });
+  }, [activePath, ensureFileContent, mainFile, t]);
 
   const extractBibKey = (bibtex: string) => {
     const match = bibtex.match(/@\w+\s*{\s*([^,\s]+)\s*,/);
@@ -1649,7 +1816,7 @@ export default function EditorPage() {
   const handleArxivSearch = useCallback(async () => {
     const query = arxivQuery.trim();
     if (!query) {
-      setArxivStatus('请输入检索关键词。');
+      setArxivStatus(t('请输入检索关键词。'));
       return;
     }
     setArxivBusy(true);
@@ -1660,11 +1827,11 @@ export default function EditorPage() {
         const res = await runAgent({
           task: 'websearch',
           prompt: [
-            'Search arXiv for the user query.',
-            `Return at most ${arxivMaxResults} papers.`,
-            'Use arxiv_search and arxiv_bibtex tools.',
-            'Return JSON ONLY in this schema:',
-            '{"papers":[{"title":"","authors":[],"arxivId":"","bibtex":""}]}.'
+            t('Search arXiv for the user query.'),
+            t('Return at most {{max}} papers.', { max: arxivMaxResults }),
+            t('Use arxiv_search and arxiv_bibtex tools.'),
+            t('Return JSON ONLY in this schema:'),
+            t('{"papers":[{"title":"","authors":[],"arxivId":"","bibtex":""}]}.')
           ].join(' '),
           selection: '',
           content: query,
@@ -1682,16 +1849,16 @@ export default function EditorPage() {
         }
         const jsonBlock = extractJsonBlock(raw);
         if (!jsonBlock) {
-          throw new Error('LLM 输出无法解析为 JSON。');
+          throw new Error(t('LLM 输出无法解析为 JSON。'));
         }
         const parsed = safeJsonParse<{ papers?: { title: string; authors?: string[]; arxivId: string; bibtex?: string }[] }>(jsonBlock);
         if (!parsed) {
-          throw new Error('LLM 输出 JSON 解析失败。');
+          throw new Error(t('LLM 输出 JSON 解析失败。'));
         }
         const papers = parsed.papers || [];
         setArxivResults(
           papers.map((paper) => ({
-            title: paper.title || '(untitled)',
+            title: paper.title || t('(untitled)'),
             abstract: '',
             authors: paper.authors || [],
             url: paper.arxivId ? `https://arxiv.org/abs/${paper.arxivId}` : '',
@@ -1707,31 +1874,31 @@ export default function EditorPage() {
         setArxivBibtexCache(cache);
         setArxivSelected({});
         if (papers.length === 0) {
-          setArxivStatus('没有匹配结果。');
+          setArxivStatus(t('没有匹配结果。'));
         }
       } else {
         const res = await arxivSearch({ query, maxResults: arxivMaxResults });
         if (!res.ok) {
-          throw new Error(res.error || '检索失败');
+          throw new Error(res.error || t('检索失败'));
         }
         setArxivResults(res.papers || []);
         setArxivSelected({});
         if ((res.papers || []).length === 0) {
-          setArxivStatus('没有匹配结果。');
+          setArxivStatus(t('没有匹配结果。'));
         }
       }
     } catch (err) {
-      setArxivStatus(`检索失败: ${String(err)}`);
+      setArxivStatus(t('检索失败: {{error}}', { error: String(err) }));
     } finally {
       setArxivBusy(false);
     }
-  }, [arxivQuery, arxivMaxResults, useLlmSearch, projectId, activePath, compileLog, searchLlmConfig]);
+  }, [arxivQuery, arxivMaxResults, useLlmSearch, projectId, activePath, compileLog, searchLlmConfig, t]);
 
   const handleArxivApply = useCallback(async () => {
     if (!projectId) return;
     const selected = arxivResults.filter((paper) => arxivSelected[paper.arxivId]);
     if (selected.length === 0) {
-      setArxivStatus('请选择要导入的论文。');
+      setArxivStatus(t('请选择要导入的论文。'));
       return;
     }
     let targetBib = bibTarget;
@@ -1743,11 +1910,11 @@ export default function EditorPage() {
       }
     }
     if (!targetBib) {
-      setArxivStatus('请先创建 Bib 文件。');
+      setArxivStatus(t('请先创建 Bib 文件。'));
       return;
     }
     setArxivBusy(true);
-    setArxivStatus('正在写入 Bib...');
+    setArxivStatus(t('正在写入 Bib...'));
     try {
       let content = await ensureFileContent(targetBib);
       const keys: string[] = [];
@@ -1756,7 +1923,7 @@ export default function EditorPage() {
         if (!bibtexSource) {
           const res = await arxivBibtex({ arxivId: paper.arxivId });
           if (!res.ok || !res.bibtex) {
-            throw new Error(res.error || `生成 BibTeX 失败: ${paper.arxivId}`);
+            throw new Error(res.error || t('生成 BibTeX 失败: {{id}}', { id: paper.arxivId }));
           }
           bibtexSource = res.bibtex;
         }
@@ -1783,7 +1950,7 @@ export default function EditorPage() {
         if (activePath && activePath.toLowerCase().endsWith('.tex')) {
           insertAtCursor(`\\cite{${keys.join(',')}}`);
         } else {
-          setArxivStatus('Bib 已写入。打开 TeX 文件后可插入引用。');
+          setArxivStatus(t('Bib 已写入。打开 TeX 文件后可插入引用。'));
           setArxivBusy(false);
           return;
         }
@@ -1791,7 +1958,7 @@ export default function EditorPage() {
       if (autoInsertToMain && keys.length > 0) {
         const targetFile = citeTargetFile || mainFile;
         if (!targetFile) {
-          setArxivStatus('未选择引用插入文件。');
+          setArxivStatus(t('未选择引用插入文件。'));
           setArxivBusy(false);
           return;
         }
@@ -1802,13 +1969,13 @@ export default function EditorPage() {
             arxivId: paper.arxivId
           }));
         const prompt = [
-          'Insert citations into the target TeX file.',
-          `Target file: ${targetFile}.`,
-          `Use \\cite{${keys.join(',')}}.`,
-          'If a Related Work section exists, add the citations there.',
-          'Otherwise add a Related Work subsection near the end and cite the papers.',
-          'Keep edits minimal and preserve formatting.',
-          citePayload.length > 0 ? `Papers: ${JSON.stringify(citePayload)}` : ''
+          t('Insert citations into the target TeX file.'),
+          t('Target file: {{file}}.', { file: targetFile }),
+          t('Use \\\\cite{{{keys}}}.', { keys: keys.join(',') }),
+          t('If a Related Work section exists, add the citations there.'),
+          t('Otherwise add a Related Work subsection near the end and cite the papers.'),
+          t('Keep edits minimal and preserve formatting.'),
+          citePayload.length > 0 ? t('Papers: {{payload}}', { payload: JSON.stringify(citePayload) }) : ''
         ].filter(Boolean).join(' ');
         try {
           const targetContent = await ensureFileContent(targetFile);
@@ -1834,27 +2001,27 @@ export default function EditorPage() {
             }));
             setPendingChanges(nextPending);
             setRightView('diff');
-            setArxivStatus('已生成引用插入建议，请在 Diff 面板应用。');
+            setArxivStatus(t('已生成引用插入建议，请在 Diff 面板应用。'));
           } else {
-            setArxivStatus('未生成可应用的引用修改。');
+            setArxivStatus(t('未生成可应用的引用修改。'));
           }
         } catch (err) {
-          setArxivStatus(`引用插入失败: ${String(err)}`);
+          setArxivStatus(t('引用插入失败: {{error}}', { error: String(err) }));
         }
       } else {
-        setArxivStatus('已写入 Bib。');
+        setArxivStatus(t('已写入 Bib。'));
       }
     } catch (err) {
-      setArxivStatus(`写入失败: ${String(err)}`);
+      setArxivStatus(t('写入失败: {{error}}', { error: String(err) }));
     } finally {
       setArxivBusy(false);
     }
-  }, [activePath, arxivResults, arxivSelected, autoInsertCite, autoInsertToMain, bibTarget, projectId, createBibFile, ensureFileContent, setEditorDoc, arxivBibtexCache, compileLog, searchLlmConfig, mainFile, files, citeTargetFile]);
+  }, [activePath, arxivResults, arxivSelected, autoInsertCite, autoInsertToMain, bibTarget, projectId, createBibFile, ensureFileContent, setEditorDoc, arxivBibtexCache, compileLog, searchLlmConfig, mainFile, files, citeTargetFile, t]);
 
   const handlePlotGenerate = async () => {
     if (!projectId) return;
     if (!selectionText || (!selectionText.includes('\\begin{tabular') && !selectionText.includes('\\begin{table'))) {
-      setPlotStatus('请在编辑器中选择一个 LaTeX 表格 (tabular)。');
+      setPlotStatus(t('请在编辑器中选择一个 LaTeX 表格 (tabular)。'));
       return;
     }
     setPlotBusy(true);
@@ -1871,16 +2038,16 @@ export default function EditorPage() {
         llmConfig
       });
       if (!res.ok || !res.assetPath) {
-        throw new Error(res.error || '图表生成失败');
+        throw new Error(res.error || t('图表生成失败'));
       }
       setPlotAssetPath(res.assetPath);
-      setPlotStatus('图表已生成');
+      setPlotStatus(t('图表已生成'));
       await refreshTree();
       if (plotAutoInsert) {
         insertFigureSnippet(res.assetPath);
       }
     } catch (err) {
-      setPlotStatus(`生成失败: ${String(err)}`);
+      setPlotStatus(t('生成失败: {{error}}', { error: String(err) }));
     } finally {
       setPlotBusy(false);
     }
@@ -1889,7 +2056,7 @@ export default function EditorPage() {
   const runWebsearch = async () => {
     const query = websearchQuery.trim();
     if (!query) {
-      setWebsearchLog(['请输入查询关键词。']);
+      setWebsearchLog([t('请输入查询关键词。')]);
       return;
     }
     setWebsearchBusy(true);
@@ -1900,57 +2067,57 @@ export default function EditorPage() {
     setWebsearchParagraph('');
     setWebsearchItemNotes({});
     try {
-      appendLog(setWebsearchLog, '拆分查询...');
+      appendLog(setWebsearchLog, t('拆分查询...'));
       const splitRes = await callLLM({
         llmConfig: searchLlmConfig,
         messages: [
-          { role: 'system', content: 'Split the query into 2-4 targeted search queries. Return JSON only: {"queries":["..."]}.' },
-          { role: 'user', content: `用户问题: ${query}` }
+          { role: 'system', content: t('Split the query into 2-4 targeted search queries. Return JSON only: {"queries":["..."]}.') },
+          { role: 'user', content: t('用户问题: {{query}}', { query }) }
         ]
       });
       if (!splitRes.ok || !splitRes.content) {
-        throw new Error(splitRes.error || 'Query split failed');
+        throw new Error(splitRes.error || t('Query split failed'));
       }
       const jsonBlock = extractJsonBlock(splitRes.content);
       if (!jsonBlock) {
-        throw new Error('无法解析拆分结果 JSON。');
+        throw new Error(t('无法解析拆分结果 JSON。'));
       }
       const parsed = safeJsonParse<{ queries?: string[] }>(jsonBlock);
       if (!parsed) {
-        throw new Error('拆分结果 JSON 解析失败。');
+        throw new Error(t('拆分结果 JSON 解析失败。'));
       }
       const queries = (parsed.queries || []).filter(Boolean).slice(0, 4);
       if (queries.length === 0) {
-        throw new Error('拆分结果为空。');
+        throw new Error(t('拆分结果为空。'));
       }
-      appendLog(setWebsearchLog, `并行检索: ${queries.join(' | ')}`);
+      appendLog(setWebsearchLog, t('并行检索: {{queries}}', { queries: queries.join(' | ') }));
       const aggregated: WebsearchItem[] = [];
       await Promise.all(
         queries.map(async (q, idx) => {
-          appendLog(setWebsearchLog, `检索中: ${q}`);
+          appendLog(setWebsearchLog, t('检索中: {{query}}', { query: q }));
           const res = await callLLM({
             llmConfig: searchLlmConfig,
             messages: [
               {
                 role: 'system',
                 content:
-                  'You are a search assistant. Use the provider search. Return JSON only: {"results":[{"title":"","summary":"","url":"","bibtex":""}]}.'
+                  t('You are a search assistant. Use the provider search. Return JSON only: {"results":[{"title":"","summary":"","url":"","bibtex":""}]}.')
               },
-              { role: 'user', content: `帮我检索: ${q}` }
+              { role: 'user', content: t('帮我检索: {{query}}', { query: q }) }
             ]
           });
           if (!res.ok || !res.content) {
-            appendLog(setWebsearchLog, `检索失败: ${q}`);
+            appendLog(setWebsearchLog, t('检索失败: {{query}}', { query: q }));
             return;
           }
           const block = extractJsonBlock(res.content);
           if (!block) {
-            appendLog(setWebsearchLog, `结果解析失败: ${q}`);
+            appendLog(setWebsearchLog, t('结果解析失败: {{query}}', { query: q }));
             return;
           }
           const parsedRes = safeJsonParse<{ results?: { title?: string; summary?: string; url?: string; bibtex?: string }[] }>(block);
           if (!parsedRes) {
-            appendLog(setWebsearchLog, `结果 JSON 解析失败: ${q}`);
+            appendLog(setWebsearchLog, t('结果 JSON 解析失败: {{query}}', { query: q }));
             return;
           }
           const results = parsedRes.results || [];
@@ -1959,14 +2126,14 @@ export default function EditorPage() {
             const citeKey = bibtex ? extractBibKey(bibtex.replace(/\\n/g, '\n')) : '';
             aggregated.push({
               id: `${idx}-${i}-${item.url || item.title || 'result'}`,
-              title: item.title || 'Untitled',
+              title: item.title || t('Untitled'),
               summary: item.summary || '',
               url: item.url || '',
               bibtex,
               citeKey
             });
           });
-          appendLog(setWebsearchLog, `完成: ${q} (${results.length})`);
+          appendLog(setWebsearchLog, t('完成: {{query}} ({{count}})', { query: q, count: results.length }));
         })
       );
       const deduped: WebsearchItem[] = [];
@@ -1976,19 +2143,19 @@ export default function EditorPage() {
         }
       });
       setWebsearchResults(deduped);
-      appendLog(setWebsearchLog, `聚合结果: ${deduped.length} 条`);
+      appendLog(setWebsearchLog, t('聚合结果: {{count}} 条', { count: deduped.length }));
       if (deduped.length === 0) {
         setWebsearchBusy(false);
         return;
       }
-      appendLog(setWebsearchLog, '生成逐条总结...');
+      appendLog(setWebsearchLog, t('生成逐条总结...'));
       const summariesRes = await callLLM({
         llmConfig: searchLlmConfig,
         messages: [
           {
             role: 'system',
             content:
-              '你是论文检索助手。请为每篇论文写一条简短总结（1-2 句）。返回 JSON：{"summaries":[{"id":"","summary":""}]}.'
+              t('你是论文检索助手。请为每篇论文写一条简短总结（1-2 句）。返回 JSON：{"summaries":[{"id":"","summary":""}]}.')
           },
           {
             role: 'user',
@@ -2017,15 +2184,15 @@ export default function EditorPage() {
             }
           });
           setWebsearchItemNotes(notes);
-          appendLog(setWebsearchLog, '逐条总结已生成。');
+          appendLog(setWebsearchLog, t('逐条总结已生成。'));
         } else {
-          appendLog(setWebsearchLog, '逐条总结解析失败。');
+          appendLog(setWebsearchLog, t('逐条总结解析失败。'));
         }
       } else {
-        appendLog(setWebsearchLog, '逐条总结生成失败。');
+        appendLog(setWebsearchLog, t('逐条总结生成失败。'));
       }
 
-      appendLog(setWebsearchLog, '生成综合总结...');
+      appendLog(setWebsearchLog, t('生成综合总结...'));
       const citeKeys = deduped.map((item) => item.citeKey).filter(Boolean);
       const paragraphRes = await callLLM({
         llmConfig: searchLlmConfig,
@@ -2033,7 +2200,7 @@ export default function EditorPage() {
           {
             role: 'system',
             content:
-              '请根据提供论文生成 3-5 句中文综合总结（不要分条）。可以使用 \\cite{...} 引用。只返回总结文本。'
+              t('请根据提供论文生成 3-5 句中文综合总结（不要分条）。可以使用 \\cite{...} 引用。只返回总结文本。')
           },
           {
             role: 'user',
@@ -2043,12 +2210,12 @@ export default function EditorPage() {
       });
       if (paragraphRes.ok && paragraphRes.content) {
         setWebsearchParagraph(paragraphRes.content.trim());
-        appendLog(setWebsearchLog, '段落已生成。');
+        appendLog(setWebsearchLog, t('段落已生成。'));
       } else {
-        appendLog(setWebsearchLog, '段落生成失败。');
+        appendLog(setWebsearchLog, t('段落生成失败。'));
       }
     } catch (err) {
-      appendLog(setWebsearchLog, `错误: ${String(err)}`);
+      appendLog(setWebsearchLog, t('错误: {{error}}', { error: String(err) }));
     } finally {
       setWebsearchBusy(false);
     }
@@ -2062,14 +2229,14 @@ export default function EditorPage() {
       if (created) targetBib = created;
     }
     if (!targetBib) {
-      setWebsearchLog((prev) => [...prev, '缺少 Bib 文件。']);
+      setWebsearchLog((prev) => [...prev, t('缺少 Bib 文件。')]);
       return;
     }
     let content = await ensureFileContent(targetBib);
     const keys: string[] = [];
     const selectedItems = websearchResults.filter((item) => websearchSelected[item.id]);
     if (selectedItems.length === 0) {
-      appendLog(setWebsearchLog, '请选择至少一条结果。');
+      appendLog(setWebsearchLog, t('请选择至少一条结果。'));
       return;
     }
     const perItemLines = selectedItems.map((item) => {
@@ -2092,16 +2259,16 @@ export default function EditorPage() {
     });
     await writeFile(projectId, targetBib, content);
     setFiles((prev) => ({ ...prev, [targetBib]: content }));
-    appendLog(setWebsearchLog, `Bib 写入完成: ${targetBib}`);
+    appendLog(setWebsearchLog, t('Bib 写入完成: {{path}}', { path: targetBib }));
 
     const targetFile = websearchTargetFile || mainFile || activePath;
     const perItemBlock = perItemLines.length
-      ? `\\paragraph{逐条总结}\n\\begin{itemize}\n${perItemLines.join('\n')}\n\\end{itemize}\n\n`
+      ? `\\paragraph{${t('逐条总结')}}\n\\begin{itemize}\n${perItemLines.join('\n')}\n\\end{itemize}\n\n`
       : '';
-    const finalBlock = websearchParagraph ? `\\paragraph{综合总结}\n${websearchParagraph}\n` : '';
+    const finalBlock = websearchParagraph ? `\\paragraph{${t('综合总结')}}\n${websearchParagraph}\n` : '';
     const insertBlock = `${perItemBlock}${finalBlock}`.trim();
     if (!insertBlock) {
-      appendLog(setWebsearchLog, '没有可插入的总结内容。');
+      appendLog(setWebsearchLog, t('没有可插入的总结内容。'));
       return;
     }
     if (targetFile && targetFile.toLowerCase().endsWith('.tex')) {
@@ -2114,12 +2281,12 @@ export default function EditorPage() {
         setEditorValue(nextContent);
         setEditorDoc(nextContent);
       }
-      appendLog(setWebsearchLog, `段落已插入 ${targetFile}`);
+      appendLog(setWebsearchLog, t('段落已插入 {{path}}', { path: targetFile }));
     } else if (activePath && activePath.toLowerCase().endsWith('.tex')) {
       if (insertBlock) {
         insertAtCursor(insertBlock, { block: true });
       }
-      appendLog(setWebsearchLog, '段落已插入光标位置。');
+      appendLog(setWebsearchLog, t('段落已插入光标位置。'));
     }
   };
 
@@ -2133,7 +2300,7 @@ export default function EditorPage() {
   const handleVisionSubmit = async () => {
     if (!projectId) return;
     if (!visionFile) {
-      setStatus('请先选择图片。');
+      setStatus(t('请先选择图片。'));
       return;
     }
     setVisionBusy(true);
@@ -2142,11 +2309,11 @@ export default function EditorPage() {
       let extraPrompt = visionPrompt.trim();
       if (!extraPrompt) {
         if (visionMode === 'table') {
-          extraPrompt = '只输出表格的 LaTeX（tabular 或 table），不要包含文档结构。';
+          extraPrompt = t('只输出表格的 LaTeX（tabular 或 table），不要包含文档结构。');
         } else if (visionMode === 'algorithm') {
-          extraPrompt = '只输出 algorithm/algorithmic 环境，不要包含文档结构。';
+          extraPrompt = t('只输出 algorithm/algorithmic 环境，不要包含文档结构。');
         } else if (visionMode === 'equation') {
-          extraPrompt = '只输出 equation 环境，不要包含文档结构。';
+          extraPrompt = t('只输出 equation 环境，不要包含文档结构。');
         }
       }
       const res = await visionToLatex({
@@ -2157,11 +2324,11 @@ export default function EditorPage() {
         llmConfig: visionLlmConfig
       });
       if (!res.ok) {
-        throw new Error(res.error || '识别失败');
+        throw new Error(res.error || t('识别失败'));
       }
       setVisionResult(res.latex || '');
     } catch (err) {
-      setStatus(`识别失败: ${String(err)}`);
+      setStatus(t('识别失败: {{error}}', { error: String(err) }));
     } finally {
       setVisionBusy(false);
     }
@@ -2292,10 +2459,10 @@ export default function EditorPage() {
       try {
         await updateFileOrder(projectId, folder, order);
       } catch (err) {
-        setStatus(`保存排序失败: ${String(err)}`);
+        setStatus(t('保存排序失败: {{error}}', { error: String(err) }));
       }
     },
-    [projectId]
+    [projectId, t]
   );
 
   const filteredTreeItems = useMemo(() => {
@@ -2340,6 +2507,19 @@ export default function EditorPage() {
   const bibFiles = useMemo(
     () => tree.filter((item) => item.type === 'file' && item.path.toLowerCase().endsWith('.bib')).map((item) => item.path),
     [tree]
+  );
+
+  const translateTargetOptions = useMemo(
+    () => [
+      { value: 'English', label: t('English') },
+      { value: '中文', label: t('中文') },
+      { value: '日本語', label: t('日本語') },
+      { value: '한국어', label: t('한국어') },
+      { value: 'Français', label: t('Français') },
+      { value: 'Deutsch', label: t('Deutsch') },
+      { value: 'Español', label: t('Español') }
+    ],
+    [t]
   );
 
   const outlineItems = useMemo(() => {
@@ -2452,7 +2632,7 @@ export default function EditorPage() {
       return;
     }
     if (!isTextFile(path)) {
-      setStatus('该文件为二进制文件，暂不支持直接编辑。');
+      setStatus(t('该文件为二进制文件，暂不支持直接编辑。'));
       return;
     }
     await openFile(path);
@@ -2473,7 +2653,7 @@ export default function EditorPage() {
             onKeyDown={(event) => {
               if (event.key === 'Enter') {
                 event.preventDefault();
-                confirmInlineEdit().catch((err) => setStatus(`操作失败: ${String(err)}`));
+                confirmInlineEdit().catch((err) => setStatus(t('操作失败: {{error}}', { error: String(err) })));
               }
               if (event.key === 'Escape') {
                 event.preventDefault();
@@ -2481,7 +2661,7 @@ export default function EditorPage() {
               }
             }}
             onBlur={() => cancelInlineEdit()}
-            placeholder={isFolder ? '新建文件夹' : '新建文件'}
+            placeholder={isFolder ? t('新建文件夹') : t('新建文件')}
           />
         </div>
       </div>
@@ -2530,7 +2710,7 @@ export default function EditorPage() {
                 setDragOverPath(node.path);
                 setDragOverKind('folder');
                 if (draggingPath) {
-                  updateDragHint(`移动到 ${node.name} 文件夹`, event);
+                  updateDragHint(t('移动到 {{name}} 文件夹', { name: node.name }), event);
                 }
               }}
               onDragLeave={() => {
@@ -2541,7 +2721,7 @@ export default function EditorPage() {
               onDrop={(event) => {
                 event.preventDefault();
                 if (event.dataTransfer.files && event.dataTransfer.files.length > 0) {
-                  handleUpload(event.dataTransfer.files, node.path).catch((err) => setStatus(`上传失败: ${String(err)}`));
+                  handleUpload(event.dataTransfer.files, node.path).catch((err) => setStatus(t('上传失败: {{error}}', { error: String(err) })));
                   setDragOverPath('');
                   setDragOverKind('');
                   setDragHint(null);
@@ -2553,10 +2733,10 @@ export default function EditorPage() {
                 setDragHint(null);
                 if (from) {
                   if (fileFilter.trim()) {
-                    setStatus('搜索过滤中无法拖拽移动。');
+                    setStatus(t('搜索过滤中无法拖拽移动。'));
                     return;
                   }
-                  moveFileWithOrder(from, node.path).catch((err) => setStatus(`移动失败: ${String(err)}`));
+                  moveFileWithOrder(from, node.path).catch((err) => setStatus(t('移动失败: {{error}}', { error: String(err) })));
                 }
               }}
             >
@@ -2569,10 +2749,10 @@ export default function EditorPage() {
                   value={inlineEdit.value}
                   onChange={(event) => setInlineEdit({ ...inlineEdit, value: event.target.value })}
                   onKeyDown={(event) => {
-                    if (event.key === 'Enter') {
-                      event.preventDefault();
-                      confirmInlineEdit().catch((err) => setStatus(`操作失败: ${String(err)}`));
-                    }
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    confirmInlineEdit().catch((err) => setStatus(t('操作失败: {{error}}', { error: String(err) })));
+                  }
                     if (event.key === 'Escape') {
                       event.preventDefault();
                       cancelInlineEdit();
@@ -2616,11 +2796,11 @@ export default function EditorPage() {
             if (draggingPath) {
               const targetParent = getParentPath(node.path);
               const fromParent = getParentPath(draggingPath);
-              const parentLabel = targetParent || '根目录';
+              const parentLabel = targetParent || t('根目录');
               const hint =
                 fromParent === targetParent
-                  ? `插入到 ${node.name} 前`
-                  : `移动到 ${parentLabel} 并插入到 ${node.name} 前`;
+                  ? t('插入到 {{name}} 前', { name: node.name })
+                  : t('移动到 {{parent}} 并插入到 {{name}} 前', { parent: parentLabel, name: node.name });
               updateDragHint(hint, event);
             }
           }}
@@ -2637,16 +2817,16 @@ export default function EditorPage() {
             setDragHint(null);
             if (!from) return;
             if (fileFilter.trim()) {
-              setStatus('搜索过滤中无法拖拽排序。');
+              setStatus(t('搜索过滤中无法拖拽排序。'));
               return;
             }
             const targetParent = getParentPath(node.path);
             const fromParent = getParentPath(from);
             if (fromParent === targetParent) {
-              reorderWithinFolder(from, node.path).catch((err) => setStatus(`排序失败: ${String(err)}`));
+              reorderWithinFolder(from, node.path).catch((err) => setStatus(t('排序失败: {{error}}', { error: String(err) })));
               return;
             }
-            moveFileWithOrder(from, targetParent, node.name).catch((err) => setStatus(`移动失败: ${String(err)}`));
+            moveFileWithOrder(from, targetParent, node.name).catch((err) => setStatus(t('移动失败: {{error}}', { error: String(err) })));
           }}
         >
           <span className={`tree-icon file ext-${getFileTypeLabel(node.path).toLowerCase()}`}>{getFileTypeLabel(node.path)}</span>
@@ -2657,10 +2837,10 @@ export default function EditorPage() {
               value={inlineEdit.value}
               onChange={(event) => setInlineEdit({ ...inlineEdit, value: event.target.value })}
               onKeyDown={(event) => {
-                if (event.key === 'Enter') {
-                  event.preventDefault();
-                  confirmInlineEdit().catch((err) => setStatus(`操作失败: ${String(err)}`));
-                }
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                confirmInlineEdit().catch((err) => setStatus(t('操作失败: {{error}}', { error: String(err) })));
+              }
                 if (event.key === 'Escape') {
                   event.preventDefault();
                   cancelInlineEdit();
@@ -2677,10 +2857,10 @@ export default function EditorPage() {
       );
     });
 
-    const compile = async () => {
+  const compile = async () => {
     if (!projectId) return;
     setIsCompiling(true);
-    setStatus('编译中...');
+    setStatus(t('编译中...'));
     try {
       const { files: serverFiles } = await getAllFiles(projectId);
       const fileMap: Record<string, string | Uint8Array> = {};
@@ -2696,55 +2876,26 @@ export default function EditorPage() {
         fileMap[activePath] = editorValue;
       }
       if (!fileMap[mainFile]) {
-        throw new Error(`主文件不存在: ${mainFile}`);
+        throw new Error(t('主文件不存在: {{file}}', { file: mainFile }));
       }
-      const compileWithSwift = async () => {
-        const engine = engineRef.current || await createLatexEngine(texliveEndpoint);
-        engineRef.current = engine;
-        setEngineName(engine.name);
-        const result = await engine.compile(fileMap, mainFile);
-        if (!result.pdf || result.pdf.length === 0) {
-          throw new Error(`编译未生成 PDF 文件 (status: ${result.status})`);
-        }
-        return result;
-      };
-
-      const compileWithBackend = async () => {
-        const res = await compileProject({ projectId, mainFile, engine: 'tectonic' });
-        if (!res.ok || !res.pdf) {
-          const detail = [res.error, res.log].filter(Boolean).join('\n');
-          throw new Error(detail || '后端编译失败');
-        }
-        const binary = Uint8Array.from(atob(res.pdf), (c) => c.charCodeAt(0));
-        return {
-          pdf: binary,
-          log: res.log || '',
-          status: res.status ?? 0,
-          engine: 'tectonic' as const
-        };
-      };
-
-      let result: CompileOutcome;
-      if (compileEngine === 'tectonic') {
-        result = await compileWithBackend();
-      } else if (compileEngine === 'swiftlatex') {
-        result = await compileWithSwift();
-      } else {
-        try {
-          result = await compileWithSwift();
-        } catch (err) {
-          setStatus('SwiftLaTeX 失败，尝试 Tectonic...');
-          result = await compileWithBackend();
-        }
+      const res = await compileProject({ projectId, mainFile, engine: compileEngine });
+      if (!res.ok || !res.pdf) {
+        const detail = [res.error, res.log].filter(Boolean).join('\n');
+        throw new Error(detail || t('后端编译失败'));
       }
+      const result: CompileOutcome = {
+        pdf: Uint8Array.from(atob(res.pdf), (c) => c.charCodeAt(0)),
+        log: res.log || '',
+        status: res.status ?? 0,
+        engine: compileEngine
+      };
 
       const meta = [
-        `Engine: ${result.engine}`,
-        `Main file: ${mainFile}`,
-        result.engine === 'swiftlatex' ? `TexLive: ${texliveEndpoint}` : ''
+        t('Engine: {{engine}}', { engine: compileEngine }),
+        t('Main file: {{file}}', { file: mainFile })
       ].filter(Boolean).join('\n');
-      setEngineName(result.engine);
-      setCompileLog(`${meta}\n\n${result.log || 'No log'}`.trim());
+      setEngineName(compileEngine);
+      setCompileLog(`${meta}\n\n${result.log || t('No log')}`.trim());
 
       const blob = new Blob([result.pdf], { type: 'application/pdf' });
       const nextUrl = URL.createObjectURL(blob);
@@ -2753,11 +2904,11 @@ export default function EditorPage() {
       }
       setPdfUrl(nextUrl);
       setRightView('pdf');
-      setStatus(`编译完成 (${result.engine})`);
+      setStatus(t('编译完成 ({{engine}})', { engine: result.engine }));
     } catch (err) {
       console.error('Compilation error:', err);
-      setCompileLog(`编译错误: ${String(err)}\n${(err as Error).stack || ''}`);
-      setStatus(`编译失败: ${String(err)}`);
+      setCompileLog(`${t('编译错误: {{error}}', { error: String(err) })}\n${(err as Error).stack || ''}`);
+      setStatus(t('编译失败: {{error}}', { error: String(err) }));
     } finally {
       setIsCompiling(false);
     }
@@ -2802,10 +2953,10 @@ export default function EditorPage() {
   const pdfScaleLabel = useMemo(() => {
     if (pdfFitWidth) {
       const fitValue = pdfFitScale ?? pdfScale;
-      return `Fit · ${Math.round(fitValue * 100)}%`;
+      return t('Fit · {{percent}}%', { percent: Math.round(fitValue * 100) });
     }
     return `${Math.round(pdfScale * 100)}%`;
-  }, [pdfFitScale, pdfFitWidth, pdfScale]);
+  }, [pdfFitScale, pdfFitWidth, pdfScale, t]);
 
   const breadcrumbParts = useMemo(() => (activePath ? activePath.split('/').filter(Boolean) : []), [activePath]);
 
@@ -2834,11 +2985,11 @@ export default function EditorPage() {
   }, []);
 
   const addPdfAnnotation = useCallback((page: number, x: number, y: number) => {
-    const text = window.prompt('输入注释内容')?.trim();
+    const text = window.prompt(t('输入注释内容'))?.trim();
     if (!text) return;
     const id = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
     setPdfAnnotations((prev) => [...prev, { id, page, x, y, text }]);
-  }, []);
+  }, [t]);
 
   const downloadPdf = useCallback(() => {
     if (!pdfUrl) return;
@@ -2908,11 +3059,11 @@ export default function EditorPage() {
     if (!activePath && !isChat) return;
     if (isChat === false && task === 'translate') {
       if (translateScope === 'selection' && !selectionText) {
-        setStatus('请选择要翻译的文本。');
+        setStatus(t('请选择要翻译的文本。'));
         return;
       }
     }
-    const userMsg: Message = { role: 'user', content: prompt || '(empty)' };
+    const userMsg: Message = { role: 'user', content: prompt || t('(empty)') };
     const setHistory = isChat ? setChatMessages : setAgentMessages;
     const history = isChat ? chatMessages : agentMessages;
     const nextHistory = [...history, userMsg];
@@ -2925,17 +3076,17 @@ export default function EditorPage() {
       let effectiveTask = task;
 
       if (!isChat && task === 'translate') {
-        const note = prompt ? `\nUser note: ${prompt}` : '';
+        const note = prompt ? `\n${t('User note')}: ${prompt}` : '';
         if (translateScope === 'project') {
           effectiveMode = 'tools';
           effectiveSelection = '';
           effectiveContent = '';
-          effectivePrompt = `Translate all .tex files in the project to ${translateTarget}. Preserve LaTeX commands and structure.${note}`;
+          effectivePrompt = t('Translate all .tex files in the project to {{target}}. Preserve LaTeX commands and structure.{{note}}', { target: translateTarget, note });
         } else if (translateScope === 'file') {
           effectiveSelection = '';
-          effectivePrompt = `Translate the current file to ${translateTarget}. Preserve LaTeX commands and structure.${note}`;
+          effectivePrompt = t('Translate the current file to {{target}}. Preserve LaTeX commands and structure.{{note}}', { target: translateTarget, note });
         } else {
-          effectivePrompt = `Translate the selected text to ${translateTarget}. Preserve LaTeX commands and structure.${note}`;
+          effectivePrompt = t('Translate the selected text to {{target}}. Preserve LaTeX commands and structure.{{note}}', { target: translateTarget, note });
         }
         effectiveTask = 'translate';
       }
@@ -2945,8 +3096,8 @@ export default function EditorPage() {
         effectiveSelection = '';
         effectiveContent = '';
         effectivePrompt = prompt
-          ? `Search arXiv and return 3-5 relevant papers with BibTeX entries. User query: ${prompt}`
-          : 'Search arXiv and return 3-5 relevant papers with BibTeX entries.';
+          ? t('Search arXiv and return 3-5 relevant papers with BibTeX entries. User query: {{query}}', { query: prompt })
+          : t('Search arXiv and return 3-5 relevant papers with BibTeX entries.');
         effectiveTask = 'websearch';
       }
 
@@ -2971,7 +3122,7 @@ export default function EditorPage() {
         interaction: isChat ? 'chat' : 'agent',
         history: nextHistory.slice(-8)
       });
-      const replyText = res.reply || '已生成建议。';
+      const replyText = res.reply || t('已生成建议。');
       setHistory((prev) => [...prev, { role: 'assistant', content: '' }]);
       window.setTimeout(() => startTypewriter(setHistory, replyText), 0);
 
@@ -2993,24 +3144,24 @@ export default function EditorPage() {
         setRightView('diff');
       }
     } catch (err) {
-      setHistory((prev) => [...prev, { role: 'assistant', content: `请求失败: ${String(err)}` }]);
+      setHistory((prev) => [...prev, { role: 'assistant', content: t('请求失败: {{error}}', { error: String(err) }) }]);
     }
   };
 
   const diagnoseCompile = async () => {
     if (!compileLog) {
-      setStatus('暂无编译日志可诊断。');
+      setStatus(t('暂无编译日志可诊断。'));
       return;
     }
     if (!activePath) return;
     setDiagnoseBusy(true);
-    const userMsg: Message = { role: 'user', content: '诊断并修复编译错误' };
+    const userMsg: Message = { role: 'user', content: t('诊断并修复编译错误') };
     const nextHistory = [...agentMessages, userMsg];
     setAgentMessages(nextHistory);
     try {
       const res = await runAgent({
         task: 'debug_compile',
-        prompt: '基于编译日志诊断并修复错误，给出可应用的 diff。',
+        prompt: t('基于编译日志诊断并修复错误，给出可应用的 diff。'),
         selection: compileLog,
         content: editorValue,
         mode: 'tools',
@@ -3023,7 +3174,7 @@ export default function EditorPage() {
       });
       const assistant: Message = {
         role: 'assistant',
-        content: res.reply || '已生成编译修复建议。'
+        content: res.reply || t('已生成编译修复建议。')
       };
       setAgentMessages((prev) => [...prev, assistant]);
       if (res.patches && res.patches.length > 0) {
@@ -3037,7 +3188,7 @@ export default function EditorPage() {
         setRightView('diff');
       }
     } catch (err) {
-      setAgentMessages((prev) => [...prev, { role: 'assistant', content: `请求失败: ${String(err)}` }]);
+      setAgentMessages((prev) => [...prev, { role: 'assistant', content: t('请求失败: {{error}}', { error: String(err) }) }]);
     } finally {
       setDiagnoseBusy(false);
     }
@@ -3061,7 +3212,7 @@ export default function EditorPage() {
       setPendingChanges([]);
       setDiffFocus(null);
     }
-    setStatus('已应用修改');
+    setStatus(t('已应用修改'));
   };
 
   const discardPending = (change?: PendingChange) => {
@@ -3138,12 +3289,12 @@ export default function EditorPage() {
       <header className="top-bar">
         <div className="brand">
           <div className="brand-title">OpenPrism</div>
-          <div className="brand-sub">{projectName || 'Editor Workspace'}</div>
+          <div className="brand-sub">{projectName || t('Editor Workspace')}</div>
         </div>
         <div className="toolbar">
-          <Link to="/projects" className="btn ghost">Projects</Link>
+          <Link to="/projects" className="btn ghost">{t('Projects')}</Link>
           <button className="btn ghost" onClick={() => setSidebarOpen((prev) => !prev)}>
-            {sidebarOpen ? '隐藏侧栏' : '显示侧栏'}
+            {sidebarOpen ? t('隐藏侧栏') : t('显示侧栏')}
           </button>
           <select
             value={mainFile}
@@ -3162,15 +3313,25 @@ export default function EditorPage() {
             onChange={(e) => setSettings((prev) => ({ ...prev, compileEngine: e.target.value as CompileEngine }))}
             className="select"
           >
-            <option value="swiftlatex">SwiftLaTeX</option>
+            <option value="pdflatex">pdfLaTeX</option>
+            <option value="xelatex">XeLaTeX</option>
+            <option value="lualatex">LuaLaTeX</option>
+            <option value="latexmk">Latexmk</option>
             <option value="tectonic">Tectonic</option>
-            <option value="auto">Auto</option>
           </select>
-          <button onClick={saveActiveFile} className="btn ghost">保存</button>
+          <button onClick={saveActiveFile} className="btn ghost">{t('保存')}</button>
           <button onClick={compile} className="btn" disabled={isCompiling}>
-            {isCompiling ? '编译中...' : '编译 PDF'}
+            {isCompiling ? t('编译中...') : t('编译 PDF')}
           </button>
-          <button className="btn ghost" onClick={() => setSettingsOpen(true)}>设置</button>
+          <button className="btn ghost" onClick={() => setSettingsOpen(true)}>{t('设置')}</button>
+          <select
+            className="select"
+            value={i18n.language}
+            onChange={(event) => i18n.changeLanguage(event.target.value)}
+          >
+            <option value="zh-CN">{t('中文')}</option>
+            <option value="en-US">{t('English')}</option>
+          </select>
         </div>
       </header>
 
@@ -3179,11 +3340,11 @@ export default function EditorPage() {
           <div>{status}</div>
           <div className={`save-indicator ${isSaving ? 'saving' : isDirty ? 'dirty' : 'saved'} ${savePulse ? 'pulse' : ''}`}>
             <span className="dot" />
-            <span>{isSaving ? '保存中...' : isDirty ? '未保存' : '已保存'}</span>
+            <span>{isSaving ? t('保存中...') : isDirty ? t('未保存') : t('已保存')}</span>
           </div>
         </div>
         <div className="status-right">
-          Compile: {compileEngine} · Engine: {engineName || '未初始化'}
+          {t('Compile')}: {compileEngine} · {t('Engine')}: {engineName || t('未初始化')}
         </div>
       </div>
 
@@ -3204,58 +3365,58 @@ export default function EditorPage() {
                 <button
                   className={`tab-btn ${activeSidebar === 'files' ? 'active' : ''}`}
                   onClick={() => setActiveSidebar('files')}
-                  title="Files"
+                  title={t('Files')}
                 >
-                  <span className="tab-icon">📁</span>
-                  <span className="tab-text">Files</span>
+                  <span className="tab-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span>
+                  <span className="tab-text">{t('Files')}</span>
                 </button>
                 <button
                   className={`tab-btn ${activeSidebar === 'agent' ? 'active' : ''}`}
                   onClick={() => setActiveSidebar('agent')}
-                  title="Agent"
+                  title={t('Agent')}
                 >
-                  <span className="tab-icon">🤖</span>
-                  <span className="tab-text">Agent</span>
+                  <span className="tab-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/></svg></span>
+                  <span className="tab-text">{t('Agent')}</span>
                 </button>
                 <button
                   className={`tab-btn ${activeSidebar === 'vision' ? 'active' : ''}`}
                   onClick={() => setActiveSidebar('vision')}
-                  title="图像识别"
+                  title={t('图像识别')}
                 >
-                  <span className="tab-icon">🔍</span>
-                  <span className="tab-text">图像识别</span>
+                  <span className="tab-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg></span>
+                  <span className="tab-text">{t('图像识别')}</span>
                 </button>
                 <button
                   className={`tab-btn ${activeSidebar === 'search' ? 'active' : ''}`}
                   onClick={() => setActiveSidebar('search')}
-                  title="论文检索"
+                  title={t('论文检索')}
                 >
-                  <span className="tab-icon">📄</span>
-                  <span className="tab-text">论文检索</span>
+                  <span className="tab-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span>
+                  <span className="tab-text">{t('论文检索')}</span>
                 </button>
                 <button
                   className={`tab-btn ${activeSidebar === 'websearch' ? 'active' : ''}`}
                   onClick={() => setActiveSidebar('websearch')}
-                  title="Websearch"
+                  title={t('Websearch')}
                 >
-                  <span className="tab-icon">🧭</span>
-                  <span className="tab-text">Websearch</span>
+                  <span className="tab-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></span>
+                  <span className="tab-text">{t('Websearch')}</span>
                 </button>
                 <button
                   className={`tab-btn ${activeSidebar === 'plot' ? 'active' : ''}`}
                   onClick={() => setActiveSidebar('plot')}
-                  title="绘图"
+                  title={t('绘图')}
                 >
-                  <span className="tab-icon">📊</span>
-                  <span className="tab-text">绘图</span>
+                  <span className="tab-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg></span>
+                  <span className="tab-text">{t('绘图')}</span>
                 </button>
                 <button
                   className={`tab-btn ${activeSidebar === 'review' ? 'active' : ''}`}
                   onClick={() => setActiveSidebar('review')}
-                  title="Review"
+                  title={t('Review')}
                 >
-                  <span className="tab-icon">✅</span>
-                  <span className="tab-text">Review</span>
+                  <span className="tab-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></span>
+                  <span className="tab-text">{t('Review')}</span>
                 </button>
               </div>
               <button className="icon-btn" onClick={() => setSidebarOpen(false)}>✕</button>
@@ -3263,11 +3424,11 @@ export default function EditorPage() {
             {activeSidebar === 'files' ? (
               <>
                 <div className="panel-header">
-                  <div>Project Files</div>
+                  <div>{t('Project Files')}</div>
                   <button
                     className="icon-btn"
                     onClick={() => setFileActionsExpanded(!fileActionsExpanded)}
-                    title={fileActionsExpanded ? "收起功能" : "展开功能"}
+                    title={fileActionsExpanded ? t('收起功能') : t('展开功能')}
                   >
                     {fileActionsExpanded ? '▲' : '▼'}
                   </button>
@@ -3275,22 +3436,22 @@ export default function EditorPage() {
                 {fileActionsExpanded && (
                   <div className="file-actions">
                   <div className="action-group">
-                    <div className="action-group-title">创建</div>
-                    <button className="btn ghost small" onClick={() => beginInlineCreate('new-file')}>新建文件</button>
-                    <button className="btn ghost small" onClick={() => beginInlineCreate('new-folder')}>新建文件夹</button>
-                    <button className="btn ghost small" onClick={createBibFile}>新建 Bib</button>
+                    <div className="action-group-title">{t('创建')}</div>
+                    <button className="btn ghost small" onClick={() => beginInlineCreate('new-file')}>{t('新建文件')}</button>
+                    <button className="btn ghost small" onClick={() => beginInlineCreate('new-folder')}>{t('新建文件夹')}</button>
+                    <button className="btn ghost small" onClick={createBibFile}>{t('新建 Bib')}</button>
                   </div>
                   <div className="action-group">
-                    <div className="action-group-title">上传</div>
-                    <button className="btn ghost small" onClick={() => fileInputRef.current?.click()}>上传文件</button>
-                    <button className="btn ghost small" onClick={() => folderInputRef.current?.click()}>上传文件夹</button>
+                    <div className="action-group-title">{t('上传')}</div>
+                    <button className="btn ghost small" onClick={() => fileInputRef.current?.click()}>{t('上传文件')}</button>
+                    <button className="btn ghost small" onClick={() => folderInputRef.current?.click()}>{t('上传文件夹')}</button>
                   </div>
                   <div className="action-group">
-                    <div className="action-group-title">操作</div>
-                    <button className="btn ghost small" onClick={() => setAllFolders(true)}>展开全部</button>
-                    <button className="btn ghost small" onClick={() => setAllFolders(false)}>收起全部</button>
-                    <button className="btn ghost small" onClick={beginInlineRename}>重命名</button>
-                    <button className="btn ghost small" onClick={() => refreshTree()}>刷新</button>
+                    <div className="action-group-title">{t('操作')}</div>
+                    <button className="btn ghost small" onClick={() => setAllFolders(true)}>{t('展开全部')}</button>
+                    <button className="btn ghost small" onClick={() => setAllFolders(false)}>{t('收起全部')}</button>
+                    <button className="btn ghost small" onClick={beginInlineRename}>{t('重命名')}</button>
+                    <button className="btn ghost small" onClick={() => refreshTree()}>{t('刷新')}</button>
                   </div>
                 </div>
                 )}
@@ -3300,7 +3461,7 @@ export default function EditorPage() {
                   multiple
                   style={{ display: 'none' }}
                   onChange={(event) => {
-                    handleUpload(event.target.files).catch((err) => setStatus(`上传失败: ${String(err)}`));
+                    handleUpload(event.target.files).catch((err) => setStatus(t('上传失败: {{error}}', { error: String(err) })));
                     if (event.target) {
                       event.target.value = '';
                     }
@@ -3313,7 +3474,7 @@ export default function EditorPage() {
                   style={{ display: 'none' }}
                   {...({ webkitdirectory: 'true', directory: 'true' } as Record<string, string>)}
                   onChange={(event) => {
-                    handleUpload(event.target.files).catch((err) => setStatus(`上传失败: ${String(err)}`));
+                    handleUpload(event.target.files).catch((err) => setStatus(t('上传失败: {{error}}', { error: String(err) })));
                     if (event.target) {
                       event.target.value = '';
                     }
@@ -3324,10 +3485,10 @@ export default function EditorPage() {
                     className="input"
                     value={fileFilter}
                     onChange={(e) => setFileFilter(e.target.value)}
-                    placeholder="搜索文件..."
+                    placeholder={t('搜索文件...')}
                   />
                 </div>
-                <div className="drag-hint muted">拖拽文件：同级排序 / 跨文件夹移动</div>
+                <div className="drag-hint muted">{t('拖拽文件：同级排序 / 跨文件夹移动')}</div>
                 <div
                   className="file-tree-body"
                   ref={fileTreeRef}
@@ -3336,22 +3497,22 @@ export default function EditorPage() {
                     setDragOverPath('');
                     setDragOverKind('');
                     if (draggingPath) {
-                      updateDragHint('移动到 根目录', event);
+                      updateDragHint(t('移动到 根目录'), event);
                     }
                   }}
                   onDrop={(event) => {
                     event.preventDefault();
                     if (event.dataTransfer.files && event.dataTransfer.files.length > 0) {
-                      handleUpload(event.dataTransfer.files).catch((err) => setStatus(`上传失败: ${String(err)}`));
+                      handleUpload(event.dataTransfer.files).catch((err) => setStatus(t('上传失败: {{error}}', { error: String(err) })));
                       return;
                     }
                     const from = event.dataTransfer.getData('text/plain');
                     if (from) {
                       if (fileFilter.trim()) {
-                        setStatus('搜索过滤中无法拖拽移动。');
+                        setStatus(t('搜索过滤中无法拖拽移动。'));
                         return;
                       }
-                      moveFileWithOrder(from, '').catch((err) => setStatus(`移动失败: ${String(err)}`));
+                      moveFileWithOrder(from, '').catch((err) => setStatus(t('移动失败: {{error}}', { error: String(err) })));
                     }
                     setDragHint(null);
                   }}
@@ -3366,7 +3527,7 @@ export default function EditorPage() {
                 </div>
                 <div className="outline-panel">
                   <div className="outline-header">
-                    <div>Outline</div>
+                    <div>{t('Outline')}</div>
                     <div className="muted">{mainFile || 'main.tex'}</div>
                   </div>
                   {mainFile && mainFile.toLowerCase().endsWith('.tex') ? (
@@ -3396,47 +3557,47 @@ export default function EditorPage() {
                         ))}
                       </div>
                     ) : (
-                      <div className="muted outline-empty">未发现 Section 标题。</div>
+                      <div className="muted outline-empty">{t('未发现 Section 标题。')}</div>
                     )
                   ) : (
-                    <div className="muted outline-empty">打开 .tex 文件以显示 Outline。</div>
+                    <div className="muted outline-empty">{t('打开 .tex 文件以显示 Outline。')}</div>
                   )}
                 </div>
               </>
             ) : activeSidebar === 'agent' ? (
               <>
                 <div className="panel-header">
-                  <div>{assistantMode === 'chat' ? 'Chat' : 'Agent'}</div>
+                  <div>{assistantMode === 'chat' ? t('Chat') : t('Agent')}</div>
                   <div className="panel-actions">
                     <div className="mode-toggle">
                       <button
                         className={`mode-btn ${assistantMode === 'chat' ? 'active' : ''}`}
                         onClick={() => setAssistantMode('chat')}
                       >
-                        Chat
+                        {t('Chat')}
                       </button>
                       <button
                         className={`mode-btn ${assistantMode === 'agent' ? 'active' : ''}`}
                         onClick={() => setAssistantMode('agent')}
                       >
-                        Agent
+                        {t('Agent')}
                       </button>
                     </div>
                   </div>
                 </div>
                 {assistantMode === 'chat' && (
                   <div className="context-tags">
-                    <span className="context-tag">只读当前文件</span>
-                    {selectionText && <span className="context-tag">只读选区</span>}
-                    {compileLog && <span className="context-tag">只读编译日志</span>}
+                    <span className="context-tag">{t('只读当前文件')}</span>
+                    {selectionText && <span className="context-tag">{t('只读选区')}</span>}
+                    {compileLog && <span className="context-tag">{t('只读编译日志')}</span>}
                   </div>
                 )}
                 <div className="chat-messages">
                   {assistantMode === 'chat' && chatMessages.length === 0 && (
-                    <div className="muted">输入问题，进行只读对话。</div>
+                    <div className="muted">{t('输入问题，进行只读对话。')}</div>
                   )}
                   {assistantMode === 'agent' && agentMessages.length === 0 && (
-                    <div className="muted">输入任务描述，生成修改建议。</div>
+                    <div className="muted">{t('输入任务描述，生成修改建议。')}</div>
                   )}
                   {(assistantMode === 'chat' ? chatMessages : agentMessages).map((msg, idx) => (
                     <div key={idx} className={`chat-msg ${msg.role}`}>
@@ -3457,14 +3618,14 @@ export default function EditorPage() {
                               setModeDropdownOpen(false);
                             }}
                           >
-                            <span>{DEFAULT_TASKS.find((item) => item.value === task)?.label || '选择任务'}</span>
+                            <span>{DEFAULT_TASKS(t).find((item) => item.value === task)?.label || t('选择任务')}</span>
                             <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className={taskDropdownOpen ? 'rotate' : ''}>
                               <path d="M3 7L6 4L9 7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
                             </svg>
                           </button>
                           {taskDropdownOpen && (
                             <div className="ios-dropdown">
-                              {DEFAULT_TASKS.map((item) => (
+                              {DEFAULT_TASKS(t).map((item) => (
                                 <div
                                   key={item.value}
                                   className={`ios-dropdown-item ${task === item.value ? 'active' : ''}`}
@@ -3493,7 +3654,7 @@ export default function EditorPage() {
                                 setTaskDropdownOpen(false);
                               }}
                             >
-                              <span>{mode === 'direct' ? 'Direct' : 'Tools'}</span>
+                              <span>{mode === 'direct' ? t('Direct') : t('Tools')}</span>
                               <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className={modeDropdownOpen ? 'rotate' : ''}>
                                 <path d="M3 7L6 4L9 7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
                               </svg>
@@ -3507,7 +3668,7 @@ export default function EditorPage() {
                                     setModeDropdownOpen(false);
                                   }}
                                 >
-                                  Direct
+                                  {t('Direct')}
                                   {mode === 'direct' && (
                                     <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
                                       <path d="M3 8L6.5 11.5L13 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
@@ -3521,7 +3682,7 @@ export default function EditorPage() {
                                     setModeDropdownOpen(false);
                                   }}
                                 >
-                                  Tools
+                                  {t('Tools')}
                                   {mode === 'tools' && (
                                     <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
                                       <path d="M3 8L6.5 11.5L13 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
@@ -3537,12 +3698,12 @@ export default function EditorPage() {
                               <path d="M8 7V11" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
                               <circle cx="8" cy="5" r="0.5" fill="currentColor"/>
                             </svg>
-                            <span className="tooltip">Direct: 单轮生成 · Tools: 多轮工具调用/多文件修改</span>
+                            <span className="tooltip">{t('Direct: 单轮生成 · Tools: 多轮工具调用/多文件修改')}</span>
                           </span>
                         </div>
                       </>
                     ) : (
-                      <div className="muted">Chat 模式仅对话，不会改动文件。</div>
+                      <div className="muted">{t('Chat 模式仅对话，不会改动文件。')}</div>
                     )}
                   </div>
                   {assistantMode === 'agent' && task === 'translate' && (
@@ -3554,9 +3715,9 @@ export default function EditorPage() {
                             setTranslateScopeDropdownOpen(!translateScopeDropdownOpen);
                             setTranslateTargetDropdownOpen(false);
                           }}
-                        >
+                          >
                           <span>
-                            {translateScope === 'selection' ? '选区' : translateScope === 'file' ? '当前文件' : '整个项目'}
+                            {translateScope === 'selection' ? t('选区') : translateScope === 'file' ? t('当前文件') : t('整个项目')}
                           </span>
                           <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className={translateScopeDropdownOpen ? 'rotate' : ''}>
                             <path d="M3 7L6 4L9 7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
@@ -3565,9 +3726,9 @@ export default function EditorPage() {
                         {translateScopeDropdownOpen && (
                           <div className="ios-dropdown">
                             {[
-                              { value: 'selection', label: '选区' },
-                              { value: 'file', label: '当前文件' },
-                              { value: 'project', label: '整个项目' }
+                              { value: 'selection', label: t('选区') },
+                              { value: 'file', label: t('当前文件') },
+                              { value: 'project', label: t('整个项目') }
                             ].map((item) => (
                               <div
                                 key={item.value}
@@ -3596,24 +3757,24 @@ export default function EditorPage() {
                             setTranslateScopeDropdownOpen(false);
                           }}
                         >
-                          <span>{translateTarget}</span>
+                          <span>{translateTargetOptions.find((item) => item.value === translateTarget)?.label || translateTarget}</span>
                           <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className={translateTargetDropdownOpen ? 'rotate' : ''}>
                             <path d="M3 7L6 4L9 7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
                           </svg>
                         </button>
                         {translateTargetDropdownOpen && (
                           <div className="ios-dropdown">
-                            {['English', '中文', '日本語', '한국어', 'Français', 'Deutsch', 'Español'].map((lang) => (
+                            {translateTargetOptions.map((lang) => (
                               <div
-                                key={lang}
-                                className={`ios-dropdown-item ${translateTarget === lang ? 'active' : ''}`}
+                                key={lang.value}
+                                className={`ios-dropdown-item ${translateTarget === lang.value ? 'active' : ''}`}
                                 onClick={() => {
-                                  setTranslateTarget(lang);
+                                  setTranslateTarget(lang.value);
                                   setTranslateTargetDropdownOpen(false);
                                 }}
                               >
-                                {lang}
-                                {translateTarget === lang && (
+                                {lang.label}
+                                {translateTarget === lang.value && (
                                   <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
                                     <path d="M3 8L6.5 11.5L13 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
                                   </svg>
@@ -3629,32 +3790,32 @@ export default function EditorPage() {
                     className="chat-input"
                     value={prompt}
                     onChange={(e) => setPrompt(e.target.value)}
-                    placeholder={assistantMode === 'chat' ? '例如：帮我解释这一段的实验设计。' : '例如：润色这个段落，使其更符合 ACL 风格。'}
+                    placeholder={assistantMode === 'chat' ? t('例如：帮我解释这一段的实验设计。') : t('例如：润色这个段落，使其更符合 ACL 风格。')}
                   />
                   <button onClick={sendPrompt} className="btn full">
-                    {assistantMode === 'chat' ? '发送' : '生成建议'}
+                    {assistantMode === 'chat' ? t('发送') : t('生成建议')}
                   </button>
                   {selectionText && assistantMode === 'agent' && (
-                    <div className="muted">已选择 {selectionText.length} 字符，将用于任务输入</div>
+                    <div className="muted">{t('已选择 {{count}} 字符，将用于任务输入', { count: selectionText.length })}</div>
                   )}
                   {assistantMode === 'agent' && task === 'translate' && translateScope === 'selection' && !selectionText && (
-                    <div className="muted">翻译选区前请先选择文本。</div>
+                    <div className="muted">{t('翻译选区前请先选择文本。')}</div>
                   )}
                 </div>
               </>
             ) : activeSidebar === 'vision' ? (
               <>
                 <div className="panel-header">
-                  <div>图像识别</div>
+                  <div>{t('图像识别')}</div>
                   <div className="panel-actions">
-                    <button className="btn ghost" onClick={() => setVisionResult('')}>清空结果</button>
+                    <button className="btn ghost" onClick={() => setVisionResult('')}>{t('清空结果')}</button>
                   </div>
                 </div>
                 <div className="tools-body">
                   <div className="tool-section">
-                    <div className="tool-title">图像转 LaTeX</div>
+                    <div className="tool-title">{t('图像转 LaTeX')}</div>
                     <div className="field">
-                      <label>识别类型</label>
+                      <label>{t('识别类型')}</label>
                       <select
                         className="select"
                         value={visionMode}
@@ -3663,15 +3824,15 @@ export default function EditorPage() {
                           setVisionResult('');
                         }}
                       >
-                        <option value="equation">公式</option>
-                        <option value="table">表格</option>
-                        <option value="figure">图像 + 图注</option>
-                        <option value="algorithm">算法</option>
-                        <option value="ocr">仅提取文字</option>
+                        <option value="equation">{t('公式')}</option>
+                        <option value="table">{t('表格')}</option>
+                        <option value="figure">{t('图像 + 图注')}</option>
+                        <option value="algorithm">{t('算法')}</option>
+                        <option value="ocr">{t('仅提取文字')}</option>
                       </select>
                     </div>
                     <div className="field">
-                      <label>上传图片</label>
+                      <label>{t('上传图片')}</label>
                       <div
                         className={`image-drop-zone ${visionFile ? 'has-file' : ''}`}
                         onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add('drag-over'); }}
@@ -3719,8 +3880,8 @@ export default function EditorPage() {
                           </div>
                         ) : (
                           <label htmlFor="vision-file-input" className="drop-zone-content">
-                            <span className="drop-icon">📷</span>
-                            <span className="drop-text">点击选择、拖拽或粘贴图片</span>
+                            <span className="drop-icon"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg></span>
+                            <span className="drop-text">{t('点击选择、拖拽或粘贴图片')}</span>
                           </label>
                         )}
                       </div>
@@ -3731,24 +3892,24 @@ export default function EditorPage() {
                       </div>
                     )}
                     <div className="field">
-                      <label>附加约束 (可选)</label>
+                      <label>{t('附加约束 (可选)')}</label>
                       <textarea
                         className="input"
                         value={visionPrompt}
                         onChange={(event) => setVisionPrompt(event.target.value)}
-                        placeholder="例如：只输出 tabular，不要表格标题"
+                        placeholder={t('例如：只输出 tabular，不要表格标题')}
                         rows={2}
                       />
                     </div>
                     <div className="vision-actions">
                       <button className="ios-btn secondary" onClick={handleVisionSubmit} disabled={visionBusy}>
-                        {visionBusy ? '识别中...' : '开始识别'}
+                        {visionBusy ? t('识别中...') : t('开始识别')}
                       </button>
-                      <button className="ios-btn primary" onClick={handleVisionInsert} disabled={!visionResult}>插入到光标</button>
+                      <button className="ios-btn primary" onClick={handleVisionInsert} disabled={!visionResult}>{t('插入到光标')}</button>
                     </div>
                     {visionResult && (
                       <div className="vision-result">
-                        <div className="muted">识别结果 (可编辑)：</div>
+                        <div className="muted">{t('识别结果 (可编辑)：')}</div>
                         <textarea
                           className="input"
                           value={visionResult}
@@ -3763,18 +3924,18 @@ export default function EditorPage() {
             ) : activeSidebar === 'search' ? (
               <>
                 <div className="panel-header">
-                  <div>论文检索</div>
+                  <div>{t('论文检索')}</div>
                 </div>
                 <div className="tools-body">
                   <div className="tool-section">
-                    <div className="tool-title">arXiv 检索</div>
+                    <div className="tool-title">{t('arXiv 检索')}</div>
                     <div className="field">
-                      <label>关键词</label>
+                      <label>{t('关键词')}</label>
                       <input
                         className="input"
                         value={arxivQuery}
                         onChange={(event) => setArxivQuery(event.target.value)}
-                        placeholder="例如: diffusion transformer compression"
+                        placeholder={t('例如: diffusion transformer compression')}
                       />
                     </div>
                     <div className="row">
@@ -3787,7 +3948,7 @@ export default function EditorPage() {
                         onChange={(event) => setArxivMaxResults(Number(event.target.value) || 5)}
                       />
                       <button className="btn ghost" onClick={handleArxivSearch} disabled={arxivBusy}>
-                        {arxivBusy ? '检索中...' : useLlmSearch ? 'LLM 检索' : '检索'}
+                        {arxivBusy ? t('检索中...') : useLlmSearch ? t('LLM 检索') : t('检索')}
                       </button>
                     </div>
                     <label className="checkbox-row">
@@ -3796,12 +3957,12 @@ export default function EditorPage() {
                         checked={useLlmSearch}
                         onChange={(event) => setUseLlmSearch(event.target.checked)}
                       />
-                      使用 Websearch 模型
+                      {t('使用 Websearch 模型')}
                     </label>
                     {arxivStatus && <div className="muted">{arxivStatus}</div>}
                     {llmSearchOutput && (
                       <div className="vision-result">
-                        <div className="muted">LLM 原始输出</div>
+                        <div className="muted">{t('LLM 原始输出')}</div>
                         <textarea
                           className="input"
                           value={llmSearchOutput}
@@ -3824,7 +3985,7 @@ export default function EditorPage() {
                             />
                             <div>
                               <div className="tool-item-title">{paper.title}</div>
-                              <div className="muted">{paper.authors?.join(', ') || 'Unknown authors'}</div>
+                              <div className="muted">{paper.authors?.join(', ') || t('Unknown authors')}</div>
                               <div className="muted">{paper.arxivId}</div>
                             </div>
                           </label>
@@ -3832,13 +3993,13 @@ export default function EditorPage() {
                       </div>
                     )}
                     <div className="field">
-                      <label>Bib 文件</label>
+                      <label>{t('Bib 文件')}</label>
                       <select
                         className="select"
                         value={bibTarget}
                         onChange={(event) => setBibTarget(event.target.value)}
                       >
-                        <option value="">(新建/选择 Bib 文件)</option>
+                        <option value="">{t('(新建/选择 Bib 文件)')}</option>
                         {bibFiles.map((path) => (
                           <option key={path} value={path}>{path}</option>
                         ))}
@@ -3846,7 +4007,7 @@ export default function EditorPage() {
                       <button className="btn ghost" onClick={async () => {
                         const created = await createBibFile();
                         if (created) setBibTarget(created);
-                      }}>新建 Bib</button>
+                      }}>{t('新建 Bib')}</button>
                     </div>
                     <label className="checkbox-row">
                       <input
@@ -3854,7 +4015,7 @@ export default function EditorPage() {
                         checked={autoInsertCite}
                         onChange={(event) => setAutoInsertCite(event.target.checked)}
                       />
-                      自动插入引用到当前 TeX
+                      {t('自动插入引用到当前 TeX')}
                     </label>
                     <label className="checkbox-row">
                       <input
@@ -3862,11 +4023,11 @@ export default function EditorPage() {
                         checked={autoInsertToMain}
                         onChange={(event) => setAutoInsertToMain(event.target.checked)}
                       />
-                      AI 插入引用到指定 TeX
+                      {t('AI 插入引用到指定 TeX')}
                     </label>
                     {autoInsertToMain && (
                       <div className="field">
-                        <label>引用插入目标</label>
+                        <label>{t('引用插入目标')}</label>
                         <select
                           className="select"
                           value={citeTargetFile}
@@ -3880,7 +4041,7 @@ export default function EditorPage() {
                     )}
                     <div className="row">
                       <button className="btn" onClick={handleArxivApply} disabled={arxivBusy}>
-                        写入 Bib / 插入引用
+                        {t('写入 Bib / 插入引用')}
                       </button>
                     </div>
                   </div>
@@ -3889,28 +4050,28 @@ export default function EditorPage() {
             ) : activeSidebar === 'websearch' ? (
               <>
                 <div className="panel-header">
-                  <div>Websearch</div>
+                  <div>{t('Websearch')}</div>
                 </div>
                 <div className="tools-body">
                   <div className="tool-section">
-                    <div className="tool-title">多点检索</div>
+                    <div className="tool-title">{t('多点检索')}</div>
                     <div className="field">
-                      <label>Query</label>
+                      <label>{t('Query')}</label>
                       <input
                         className="input"
                         value={websearchQuery}
                         onChange={(event) => setWebsearchQuery(event.target.value)}
-                        placeholder="例如: diffusion editing for safety"
+                        placeholder={t('例如: diffusion editing for safety')}
                       />
                     </div>
                     <div className="row">
                       <button className="btn" onClick={runWebsearch} disabled={websearchBusy}>
-                        {websearchBusy ? '检索中...' : '开始检索'}
+                        {websearchBusy ? t('检索中...') : t('开始检索')}
                       </button>
                     </div>
                     <div className="websearch-log">
                       {websearchLog.length === 0 ? (
-                        <div className="muted">等待查询...</div>
+                        <div className="muted">{t('等待查询...')}</div>
                       ) : (
                         websearchLog.map((line, idx) => (
                           <div key={idx} className="websearch-line">{line}</div>
@@ -3934,7 +4095,7 @@ export default function EditorPage() {
                                 setWebsearchSelected(next);
                               }}
                             />
-                            全选
+                            {t('全选')}
                           </label>
                           <button
                             className="btn ghost small"
@@ -3945,11 +4106,11 @@ export default function EditorPage() {
                                 .filter(Boolean);
                               if (keys.length > 0) {
                                 insertAtCursor(`\\cite{${keys.join(',')}}`);
-                                appendLog(setWebsearchLog, '已插入选中引用到光标。');
+                                appendLog(setWebsearchLog, t('已插入选中引用到光标。'));
                               }
                             }}
                           >
-                            插入选中引用
+                            {t('插入选中引用')}
                           </button>
                         </div>
                         <div className="tool-list">
@@ -3967,30 +4128,30 @@ export default function EditorPage() {
                                 <div className="tool-item-title">{paper.title}</div>
                                 {paper.summary && <div className="muted">{paper.summary}</div>}
                                 {paper.url && <div className="muted">{paper.url}</div>}
-                                {paper.citeKey && <div className="muted">cite: {paper.citeKey}</div>}
+                                {paper.citeKey && <div className="muted">{t('cite')}: {paper.citeKey}</div>}
                               </div>
                               <button
                                 className="btn ghost small"
                                 onClick={() => {
                                   if (paper.citeKey) {
                                     insertAtCursor(`\\cite{${paper.citeKey}}`);
-                                    appendLog(setWebsearchLog, `已插入: ${paper.citeKey}`);
+                                    appendLog(setWebsearchLog, t('已插入: {{cite}}', { cite: paper.citeKey }));
                                   }
                                 }}
                               >
-                                插入引用
+                                {t('插入引用')}
                               </button>
                             </label>
                           ))}
                         </div>
                         <div className="vision-result">
-                          <div className="muted">逐条总结</div>
+                          <div className="muted">{t('逐条总结')}</div>
                           <div className="tool-list">
                             {websearchResults.map((paper) => (
                               <div key={paper.id} className="tool-item summary-item">
                                 <div>
                                   <div className="tool-item-title">{paper.title}</div>
-                                  {paper.citeKey && <div className="muted">cite: {paper.citeKey}</div>}
+                                  {paper.citeKey && <div className="muted">{t('cite')}: {paper.citeKey}</div>}
                                 </div>
                                 <textarea
                                   className="input"
@@ -4008,7 +4169,7 @@ export default function EditorPage() {
                     )}
                     {websearchParagraph && (
                       <div className="vision-result">
-                        <div className="muted">综合总结</div>
+                        <div className="muted">{t('综合总结')}</div>
                         <textarea
                           className="input"
                           value={websearchParagraph}
@@ -4018,13 +4179,13 @@ export default function EditorPage() {
                       </div>
                     )}
                     <div className="field">
-                      <label>Bib 文件</label>
+                      <label>{t('Bib 文件')}</label>
                       <select
                         className="select"
                         value={websearchTargetBib}
                         onChange={(event) => setWebsearchTargetBib(event.target.value)}
                       >
-                        <option value="">(新建/选择 Bib 文件)</option>
+                        <option value="">{t('(新建/选择 Bib 文件)')}</option>
                         {bibFiles.map((path) => (
                           <option key={path} value={path}>{path}</option>
                         ))}
@@ -4032,10 +4193,10 @@ export default function EditorPage() {
                       <button className="btn ghost small" onClick={async () => {
                         const created = await createBibFile();
                         if (created) setWebsearchTargetBib(created);
-                      }}>新建 Bib</button>
+                      }}>{t('新建 Bib')}</button>
                     </div>
                     <div className="field">
-                      <label>插入目标 TeX</label>
+                      <label>{t('插入目标 TeX')}</label>
                       <select
                         className="select"
                         value={websearchTargetFile}
@@ -4048,7 +4209,7 @@ export default function EditorPage() {
                     </div>
                     <div className="row">
                       <button className="btn" onClick={applyWebsearchInsert} disabled={websearchBusy}>
-                        一键写入 Bib + 插入总结
+                        {t('一键写入 Bib + 插入总结')}
                       </button>
                     </div>
                   </div>
@@ -4057,35 +4218,35 @@ export default function EditorPage() {
             ) : activeSidebar === 'plot' ? (
               <>
                 <div className="panel-header">
-                  <div>绘图</div>
+                  <div>{t('绘图')}</div>
                 </div>
                 <div className="tools-body">
                   <div className="tool-section">
-                    <div className="tool-title">表格 → 图表</div>
-                    <div className="muted">从选区表格生成图表（seaborn）</div>
+                    <div className="tool-title">{t('表格 → 图表')}</div>
+                    <div className="muted">{t('从选区表格生成图表（seaborn）')}</div>
                     <div className="field">
-                      <label>图表类型</label>
+                      <label>{t('图表类型')}</label>
                       <select
                         className="select"
                         value={plotType}
                         onChange={(event) => setPlotType(event.target.value as 'bar' | 'line' | 'heatmap')}
                       >
-                        <option value="bar">Bar</option>
-                        <option value="line">Line</option>
-                        <option value="heatmap">Heatmap</option>
+                        <option value="bar">{t('Bar')}</option>
+                        <option value="line">{t('Line')}</option>
+                        <option value="heatmap">{t('Heatmap')}</option>
                       </select>
                     </div>
                     <div className="field">
-                      <label>标题 (可选)</label>
+                      <label>{t('标题 (可选)')}</label>
                       <input
                         className="input"
                         value={plotTitle}
                         onChange={(event) => setPlotTitle(event.target.value)}
-                        placeholder="Chart title"
+                        placeholder={t('Chart title')}
                       />
                     </div>
                     <div className="field">
-                      <label>文件名 (可选)</label>
+                      <label>{t('文件名 (可选)')}</label>
                       <input
                         className="input"
                         value={plotFilename}
@@ -4094,17 +4255,17 @@ export default function EditorPage() {
                       />
                     </div>
                     <div className="field">
-                      <label>补充提示 (可选)</label>
+                      <label>{t('补充提示 (可选)')}</label>
                       <textarea
                         className="input"
                         value={plotPrompt}
                         onChange={(event) => setPlotPrompt(event.target.value)}
-                        placeholder="例如：使用折线图，突出 Method A；加上 legend；设置 y 轴为 Accuracy"
+                        placeholder={t('例如：使用折线图，突出 Method A；加上 legend；设置 y 轴为 Accuracy')}
                         rows={2}
                       />
                     </div>
                     <div className="field">
-                      <label>Debug 重试次数</label>
+                      <label>{t('Debug 重试次数')}</label>
                       <input
                         className="input"
                         type="number"
@@ -4120,24 +4281,24 @@ export default function EditorPage() {
                         checked={plotAutoInsert}
                         onChange={(event) => setPlotAutoInsert(event.target.checked)}
                       />
-                      生成后插入 Figure
+                      {t('生成后插入 Figure')}
                     </label>
                     <div className="row">
                       <button className="btn" onClick={handlePlotGenerate} disabled={plotBusy}>
-                        {plotBusy ? '生成中...' : '生成图表'}
+                        {plotBusy ? t('生成中...') : t('生成图表')}
                       </button>
                     </div>
                     {plotStatus && <div className="muted">{plotStatus}</div>}
                     {plotAssetPath && (
                       <div className="vision-result">
-                        <div className="muted">预览</div>
+                        <div className="muted">{t('预览')}</div>
                         <img
                           src={`/api/projects/${projectId}/blob?path=${encodeURIComponent(plotAssetPath)}`}
                           alt={plotAssetPath}
                           style={{ width: '100%', borderRadius: '8px' }}
                         />
                         <div className="row">
-                          <button className="btn ghost" onClick={() => insertFigureSnippet(plotAssetPath)}>插入图模板</button>
+                          <button className="btn ghost" onClick={() => insertFigureSnippet(plotAssetPath)}>{t('插入图模板')}</button>
                         </div>
                       </div>
                     )}
@@ -4147,19 +4308,19 @@ export default function EditorPage() {
             ) : activeSidebar === 'review' ? (
               <>
                 <div className="panel-header">
-                  <div>Review</div>
+                  <div>{t('Review')}</div>
                 </div>
                 <div className="tools-body">
                   <div className="tool-section">
-                    <div className="tool-title">质量检查</div>
-                    <div className="tool-desc">AI 辅助检查论文质量，发现潜在问题</div>
+                    <div className="tool-title">{t('质量检查')}</div>
+                    <div className="tool-desc">{t('AI 辅助检查论文质量，发现潜在问题')}</div>
                     <div className="review-buttons">
                       <button
                         className="review-btn"
                         onClick={async () => {
                           const res = await runAgent({
                             task: 'consistency_check',
-                            prompt: 'Check terminology, notation, and consistency across the project. Return concise findings.',
+                            prompt: t('Check terminology, notation, and consistency across the project. Return concise findings.'),
                             selection: '',
                             content: '',
                             mode: 'tools',
@@ -4170,7 +4331,7 @@ export default function EditorPage() {
                             interaction: 'agent',
                             history: []
                           });
-                          setReviewNotes((prev) => [{ title: '一致性检查', content: res.reply || '无结果' }, ...prev]);
+                          setReviewNotes((prev) => [{ title: t('一致性检查'), content: res.reply || t('无结果') }, ...prev]);
                           if (res.patches && res.patches.length > 0) {
                             const nextPending = res.patches.map((patch) => ({
                               filePath: patch.path,
@@ -4183,16 +4344,16 @@ export default function EditorPage() {
                           }
                         }}
                       >
-                        <span className="review-btn-icon">🔍</span>
-                        <span className="review-btn-label">一致性检查</span>
-                        <span className="review-btn-desc">检查术语、符号一致性</span>
+                        <span className="review-btn-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></span>
+                        <span className="review-btn-label">{t('一致性检查')}</span>
+                        <span className="review-btn-desc">{t('检查术语、符号一致性')}</span>
                       </button>
                       <button
                         className="review-btn"
                         onClick={async () => {
                           const res = await runAgent({
                             task: 'missing_citations',
-                            prompt: 'Find claims that likely need citations and list them.',
+                            prompt: t('Find claims that likely need citations and list them.'),
                             selection: '',
                             content: '',
                             mode: 'tools',
@@ -4203,19 +4364,19 @@ export default function EditorPage() {
                             interaction: 'agent',
                             history: []
                           });
-                          setReviewNotes((prev) => [{ title: '引用缺失', content: res.reply || '无结果' }, ...prev]);
+                          setReviewNotes((prev) => [{ title: t('引用缺失'), content: res.reply || t('无结果') }, ...prev]);
                         }}
                       >
-                        <span className="review-btn-icon">📚</span>
-                        <span className="review-btn-label">引用缺失</span>
-                        <span className="review-btn-desc">查找需要引用的论述</span>
+                        <span className="review-btn-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg></span>
+                        <span className="review-btn-label">{t('引用缺失')}</span>
+                        <span className="review-btn-desc">{t('查找需要引用的论述')}</span>
                       </button>
                       <button
                         className="review-btn"
                         onClick={async () => {
                           const res = await runAgent({
                             task: 'compile_summary',
-                            prompt: 'Summarize compile log errors and suggested fixes.',
+                            prompt: t('Summarize compile log errors and suggested fixes.'),
                             selection: compileLog,
                             content: '',
                             mode: 'direct',
@@ -4226,18 +4387,18 @@ export default function EditorPage() {
                             interaction: 'agent',
                             history: []
                           });
-                          setReviewNotes((prev) => [{ title: '编译日志总结', content: res.reply || '无结果' }, ...prev]);
+                          setReviewNotes((prev) => [{ title: t('编译日志总结'), content: res.reply || t('无结果') }, ...prev]);
                         }}
                       >
-                        <span className="review-btn-icon">📋</span>
-                        <span className="review-btn-label">编译日志总结</span>
-                        <span className="review-btn-desc">总结错误并给出修复建议</span>
+                        <span className="review-btn-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg></span>
+                        <span className="review-btn-label">{t('编译日志总结')}</span>
+                        <span className="review-btn-desc">{t('总结错误并给出修复建议')}</span>
                       </button>
                     </div>
                   </div>
                   {reviewNotes.length > 0 && (
                     <div className="tool-section">
-                      <div className="tool-title">结果</div>
+                      <div className="tool-title">{t('结果')}</div>
                       {reviewNotes.map((note, idx) => (
                         <div key={`${note.title}-${idx}`} className="review-item">
                           <div className="review-title">{note.title}</div>
@@ -4260,9 +4421,9 @@ export default function EditorPage() {
         )}
 
         <section className="panel editor-panel">
-          <div className="panel-header">Editor</div>
+          <div className="panel-header">{t('Editor')}</div>
           <div className="breadcrumb-bar">
-            <span className="breadcrumb-item">{projectName || 'Project'}</span>
+            <span className="breadcrumb-item">{projectName || t('Project')}</span>
             {breadcrumbParts.map((part, idx) => (
               <span key={`${part}-${idx}`} className="breadcrumb-item">{part}</span>
             ))}
@@ -4272,28 +4433,28 @@ export default function EditorPage() {
           </div>
           <div className="editor-toolbar">
             <div className="toolbar-group">
-              <button className="toolbar-btn" onClick={insertSectionSnippet}>Section</button>
-              <button className="toolbar-btn" onClick={insertSubsectionSnippet}>Subsection</button>
-              <button className="toolbar-btn" onClick={insertSubsubsectionSnippet}>Subsubsection</button>
+              <button className="toolbar-btn" onClick={insertSectionSnippet}>{t('Section')}</button>
+              <button className="toolbar-btn" onClick={insertSubsectionSnippet}>{t('Subsection')}</button>
+              <button className="toolbar-btn" onClick={insertSubsubsectionSnippet}>{t('Subsubsection')}</button>
             </div>
             <div className="toolbar-divider" />
             <div className="toolbar-group">
-              <button className="toolbar-btn" onClick={insertItemizeSnippet}>Itemize</button>
-              <button className="toolbar-btn" onClick={insertEnumerateSnippet}>Enumerate</button>
-              <button className="toolbar-btn" onClick={insertEquationSnippet}>Equation</button>
-              <button className="toolbar-btn" onClick={insertAlgorithmSnippet}>Algorithm</button>
+              <button className="toolbar-btn" onClick={insertItemizeSnippet}>{t('Itemize')}</button>
+              <button className="toolbar-btn" onClick={insertEnumerateSnippet}>{t('Enumerate')}</button>
+              <button className="toolbar-btn" onClick={insertEquationSnippet}>{t('Equation')}</button>
+              <button className="toolbar-btn" onClick={insertAlgorithmSnippet}>{t('Algorithm')}</button>
             </div>
             <div className="toolbar-divider" />
             <div className="toolbar-group">
-              <button className="toolbar-btn" onClick={insertFigureTemplate}>Figure</button>
-              <button className="toolbar-btn" onClick={insertTableSnippet}>Table</button>
-              <button className="toolbar-btn" onClick={insertListingSnippet}>Listing</button>
+              <button className="toolbar-btn" onClick={insertFigureTemplate}>{t('Figure')}</button>
+              <button className="toolbar-btn" onClick={insertTableSnippet}>{t('Table')}</button>
+              <button className="toolbar-btn" onClick={insertListingSnippet}>{t('Listing')}</button>
             </div>
             <div className="toolbar-divider" />
             <div className="toolbar-group">
-              <button className="toolbar-btn" onClick={insertCiteSnippet}>Cite</button>
-              <button className="toolbar-btn" onClick={insertRefSnippet}>Ref</button>
-              <button className="toolbar-btn" onClick={insertLabelSnippet}>Label</button>
+              <button className="toolbar-btn" onClick={insertCiteSnippet}>{t('Cite')}</button>
+              <button className="toolbar-btn" onClick={insertRefSnippet}>{t('Ref')}</button>
+              <button className="toolbar-btn" onClick={insertLabelSnippet}>{t('Label')}</button>
             </div>
           </div>
           <div
@@ -4302,7 +4463,7 @@ export default function EditorPage() {
           >
             <div className="editor-area" ref={editorAreaRef}>
               <div ref={editorHostRef} className="editor-host" />
-              <div className="editor-hint muted">快捷键: Option/Alt + / 或 Cmd/Ctrl + Space 补全；Cmd/Ctrl + / 注释；Cmd/Ctrl + F 搜索；Cmd/Ctrl + S 保存</div>
+              <div className="editor-hint muted">{t('快捷键: Option/Alt + / 或 Cmd/Ctrl + Space 补全；Cmd/Ctrl + / 注释；Cmd/Ctrl + F 搜索；Cmd/Ctrl + S 保存')}</div>
               {(inlineSuggestionText || isSuggesting) && suggestionPos && (
                 <div
                   className={`suggestion-popover ${isSuggesting && !inlineSuggestionText ? 'loading' : ''}`}
@@ -4311,14 +4472,14 @@ export default function EditorPage() {
                   {isSuggesting && !inlineSuggestionText ? (
                     <div className="suggestion-loading">
                       <span className="spinner" />
-                      AI 补全中...
+                      {t('AI 补全中...')}
                     </div>
                   ) : (
                     <>
                       <div className="suggestion-preview">{inlineSuggestionText}</div>
                       <div className="row">
-                        <button className="btn" onClick={() => acceptSuggestionRef.current()}>接受</button>
-                        <button className="btn ghost" onClick={() => clearSuggestionRef.current()}>拒绝</button>
+                        <button className="btn" onClick={() => acceptSuggestionRef.current()}>{t('接受')}</button>
+                        <button className="btn ghost" onClick={() => clearSuggestionRef.current()}>{t('拒绝')}</button>
                       </div>
                     </>
                   )}
@@ -4335,7 +4496,7 @@ export default function EditorPage() {
 
         <section className="panel pdf-panel">
           <div className="panel-header">
-            <div>Preview</div>
+            <div>{t('Preview')}</div>
             <div className="header-controls">
               <select
                 className="select"
@@ -4343,7 +4504,7 @@ export default function EditorPage() {
                 onChange={(event) => setRightView(event.target.value as 'pdf' | 'figures' | 'diff' | 'log' | 'toc')}
               >
                 <option value="pdf">PDF</option>
-                <option value="toc">目录</option>
+                <option value="toc">{t('目录')}</option>
                 <option value="figures">FIG</option>
                 <option value="diff">DIFF</option>
                 <option value="log">LOG</option>
@@ -4359,7 +4520,7 @@ export default function EditorPage() {
                       <button className="icon-btn" onClick={() => zoomPdf(-0.1)} disabled={!pdfUrl}>−</button>
                       <div className="zoom-label">{pdfScaleLabel}</div>
                       <button className="icon-btn" onClick={() => zoomPdf(0.1)} disabled={!pdfUrl}>＋</button>
-                      <button className="btn ghost small" onClick={() => setPdfFitWidth(true)} disabled={!pdfUrl}>适合宽度</button>
+                      <button className="btn ghost small" onClick={() => setPdfFitWidth(true)} disabled={!pdfUrl}>{t('适合宽度')}</button>
                       <button
                         className="btn ghost small"
                         onClick={() => {
@@ -4372,20 +4533,20 @@ export default function EditorPage() {
                       </button>
                     </div>
                     <div className="toolbar-group">
-                      <button className="btn ghost small" onClick={downloadPdf} disabled={!pdfUrl}>下载 PDF</button>
+                      <button className="btn ghost small" onClick={downloadPdf} disabled={!pdfUrl}>{t('下载 PDF')}</button>
                       <button
                         className={`btn ghost small ${pdfSpread ? 'active' : ''}`}
                         onClick={() => setPdfSpread((prev) => !prev)}
                         disabled={!pdfUrl}
                       >
-                        双页
+                        {t('双页')}
                       </button>
                       <button
                         className={`btn ghost small ${pdfAnnotateMode ? 'active' : ''}`}
                         onClick={() => setPdfAnnotateMode((prev) => !prev)}
                         disabled={!pdfUrl}
                       >
-                        注释
+                        {t('注释')}
                       </button>
                     </div>
                   </div>
@@ -4418,11 +4579,11 @@ export default function EditorPage() {
                       }}
                     />
                   ) : (
-                    <div className="muted pdf-empty-message">尚未生成 PDF</div>
+                    <div className="muted pdf-empty-message">{t('尚未生成 PDF')}</div>
                   )}
                   {pdfAnnotations.length > 0 && (
                     <div className="pdf-annotations">
-                      <div className="muted">注释</div>
+                      <div className="muted">{t('注释')}</div>
                       <div className="annotation-list">
                         {pdfAnnotations.map((note) => (
                           <div key={note.id} className="annotation-item">
@@ -4450,9 +4611,9 @@ export default function EditorPage() {
               )}
               {rightView === 'toc' && (
                 <div className="toc-panel">
-                  <div className="toc-title">目录</div>
+                  <div className="toc-title">{t('目录')}</div>
                   {pdfOutline.length === 0 ? (
-                    <div className="muted">暂无目录信息。</div>
+                    <div className="muted">{t('暂无目录信息。')}</div>
                   ) : (
                     <div className="toc-list">
                       {pdfOutline.map((item, idx) => (
@@ -4475,22 +4636,29 @@ export default function EditorPage() {
                 </div>
               )}
               {rightView === 'figures' && (
-                <div className="figure-panel">
-                  <div className="figure-list">
-                    {figureFiles.map((item) => (
+                <div className="figure-panel-v2">
+                  <div className="figure-topbar">
+                    <select
+                      className="figure-select"
+                      value={selectedFigure || ''}
+                      onChange={(e) => setSelectedFigure(e.target.value)}
+                    >
+                      <option value="" disabled>{t('选择图片进行预览。')}</option>
+                      {figureFiles.map((item) => (
+                        <option key={item.path} value={item.path}>{item.path}</option>
+                      ))}
+                    </select>
+                    {selectedFigure && (
                       <button
-                        key={item.path}
-                        className={`figure-item ${selectedFigure === item.path ? 'active' : ''}`}
-                        onClick={() => setSelectedFigure(item.path)}
+                        className="figure-insert-btn"
+                        onClick={() => insertFigureSnippet(selectedFigure)}
                       >
-                        {item.path}
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+                        {t('插入到光标')}
                       </button>
-                    ))}
-                    {figureFiles.length === 0 && (
-                      <div className="muted">暂无图片文件。</div>
                     )}
                   </div>
-                  <div className="figure-preview">
+                  <div className="figure-display">
                     {selectedFigure ? (
                       selectedFigure.toLowerCase().endsWith('.pdf') ? (
                         <object data={`/api/projects/${projectId}/blob?path=${encodeURIComponent(selectedFigure)}`} type="application/pdf" />
@@ -4498,20 +4666,18 @@ export default function EditorPage() {
                         <img src={`/api/projects/${projectId}/blob?path=${encodeURIComponent(selectedFigure)}`} alt={selectedFigure} />
                       )
                     ) : (
-                      <div className="muted">选择图片进行预览。</div>
+                      <div className="figure-empty">
+                        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+                        <span>{t('选择图片进行预览。')}</span>
+                      </div>
                     )}
                   </div>
-                  {selectedFigure && (
-                    <div className="figure-actions">
-                      <button className="btn ghost" onClick={() => insertFigureSnippet(selectedFigure)}>插入图模板</button>
-                    </div>
-                  )}
                 </div>
               )}
               {rightView === 'diff' && (
                 <div className="diff-panel">
-                  <div className="diff-title">Diff Preview ({pendingGrouped.length})</div>
-                  {pendingGrouped.length === 0 && <div className="muted">暂无待确认修改。</div>}
+                  <div className="diff-title">{t('Diff Preview ({{count}})', { count: pendingGrouped.length })}</div>
+                  {pendingGrouped.length === 0 && <div className="muted">{t('暂无待确认修改。')}</div>}
                   {pendingGrouped.map((change) => (
                     (() => {
                       const rows = buildSplitDiff(change.original, change.proposed);
@@ -4519,12 +4685,12 @@ export default function EditorPage() {
                         <div key={change.filePath} className="diff-item">
                           <div className="diff-header">
                             <div className="diff-path">{change.filePath}</div>
-                            <button className="btn ghost" onClick={() => setDiffFocus(change)}>放大</button>
+                            <button className="btn ghost" onClick={() => setDiffFocus(change)}>{t('放大')}</button>
                           </div>
                           <SplitDiffView rows={rows} />
                           <div className="row">
-                            <button className="btn" onClick={() => applyPending(change)}>应用此修改</button>
-                            <button className="btn ghost" onClick={() => discardPending(change)}>放弃</button>
+                            <button className="btn" onClick={() => applyPending(change)}>{t('应用此修改')}</button>
+                            <button className="btn ghost" onClick={() => discardPending(change)}>{t('放弃')}</button>
                           </div>
                         </div>
                       );
@@ -4532,8 +4698,8 @@ export default function EditorPage() {
                   ))}
                   {pendingGrouped.length > 1 && (
                     <div className="row">
-                      <button className="btn" onClick={() => applyPending()}>应用全部</button>
-                      <button className="btn ghost" onClick={() => discardPending()}>全部放弃</button>
+                      <button className="btn" onClick={() => applyPending()}>{t('应用全部')}</button>
+                      <button className="btn ghost" onClick={() => discardPending()}>{t('全部放弃')}</button>
                     </div>
                   )}
                 </div>
@@ -4541,19 +4707,17 @@ export default function EditorPage() {
               {rightView === 'log' && (
                 <div className="log-panel">
                   <div className="log-title">
-                    Compile Log
-                    {assistantMode === 'agent' && (
-                      <button className="btn ghost log-action" onClick={diagnoseCompile} disabled={diagnoseBusy}>
-                        {diagnoseBusy ? (
-                          <span className="suggestion-loading">
-                            <span className="spinner" />
-                            诊断中...
-                          </span>
-                        ) : (
-                          '一键诊断'
-                        )}
-                      </button>
-                    )}
+                    {t('Compile Log')}
+                    <button className="btn ghost log-action" onClick={diagnoseCompile} disabled={diagnoseBusy}>
+                      {diagnoseBusy ? (
+                        <span className="suggestion-loading">
+                          <span className="spinner" />
+                          {t('诊断中...')}
+                        </span>
+                      ) : (
+                        t('一键诊断')
+                      )}
+                    </button>
                   </div>
                   {compileErrors.length > 0 && (
                     <div className="log-errors">
@@ -4570,7 +4734,7 @@ export default function EditorPage() {
                       ))}
                     </div>
                   )}
-                  <pre className="log-content">{compileLog || '暂无编译日志'}</pre>
+                  <pre className="log-content">{compileLog || t('暂无编译日志')}</pre>
                 </div>
               )}
             </div>
@@ -4581,31 +4745,22 @@ export default function EditorPage() {
         <div className="modal-backdrop" onClick={() => setSettingsOpen(false)}>
           <div className="modal" onClick={(event) => event.stopPropagation()}>
             <div className="modal-header">
-              <div>Workspace Settings</div>
+              <div>{t('Workspace Settings')}</div>
               <button className="icon-btn" onClick={() => setSettingsOpen(false)}>✕</button>
             </div>
             <div className="modal-body">
               <div className="field">
-                <label>TexLive Endpoint</label>
-                <input
-                  className="input"
-                  value={texliveEndpoint}
-                  onChange={(e) => setSettings((prev) => ({ ...prev, texliveEndpoint: e.target.value }))}
-                  placeholder="https://texlive.swiftlatex.com"
-                />
-              </div>
-              <div className="field">
-                <label>LLM Endpoint</label>
+                <label>{t('LLM Endpoint')}</label>
                 <input
                   className="input"
                   value={llmEndpoint}
                   onChange={(e) => setSettings((prev) => ({ ...prev, llmEndpoint: e.target.value }))}
                   placeholder="https://api.openai.com/v1/chat/completions"
                 />
-                <div className="muted">支持 OpenAI 兼容的 base_url，例如 https://api.apiyi.com/v1</div>
+                <div className="muted">{t('支持 OpenAI 兼容的 base_url，例如 https://api.apiyi.com/v1')}</div>
               </div>
               <div className="field">
-                <label>LLM Model</label>
+                <label>{t('LLM Model')}</label>
                 <input
                   className="input"
                   value={llmModel}
@@ -4614,7 +4769,7 @@ export default function EditorPage() {
                 />
               </div>
               <div className="field">
-                <label>LLM API Key</label>
+                <label>{t('LLM API Key')}</label>
                 <input
                   className="input"
                   value={llmApiKey}
@@ -4623,21 +4778,21 @@ export default function EditorPage() {
                   type="password"
                 />
                 {!llmApiKey && (
-                  <div className="muted">未配置 API Key 时将使用后端环境变量。</div>
+                  <div className="muted">{t('未配置 API Key 时将使用后端环境变量。')}</div>
                 )}
               </div>
               <div className="field">
-                <label>Search LLM Endpoint (可选)</label>
+                <label>{t('Search LLM Endpoint (可选)')}</label>
                 <input
                   className="input"
                   value={searchEndpoint}
                   onChange={(e) => setSettings((prev) => ({ ...prev, searchEndpoint: e.target.value }))}
                   placeholder="https://api.apiyi.com/v1"
                 />
-                <div className="muted">仅用于“检索/websearch”任务，留空则复用 LLM Endpoint。</div>
+                <div className="muted">{t('仅用于“检索/websearch”任务，留空则复用 LLM Endpoint。')}</div>
               </div>
               <div className="field">
-                <label>Search LLM Model (可选)</label>
+                <label>{t('Search LLM Model (可选)')}</label>
                 <input
                   className="input"
                   value={searchModel}
@@ -4646,7 +4801,7 @@ export default function EditorPage() {
                 />
               </div>
               <div className="field">
-                <label>Search LLM API Key (可选)</label>
+                <label>{t('Search LLM API Key (可选)')}</label>
                 <input
                   className="input"
                   value={searchApiKey}
@@ -4656,17 +4811,17 @@ export default function EditorPage() {
                 />
               </div>
               <div className="field">
-                <label>VLM Endpoint (可选)</label>
+                <label>{t('VLM Endpoint (可选)')}</label>
                 <input
                   className="input"
                   value={visionEndpoint}
                   onChange={(e) => setSettings((prev) => ({ ...prev, visionEndpoint: e.target.value }))}
                   placeholder="https://api.apiyi.com/v1"
                 />
-                <div className="muted">仅用于图像识别，留空则复用 LLM Endpoint。</div>
+                <div className="muted">{t('仅用于图像识别，留空则复用 LLM Endpoint。')}</div>
               </div>
               <div className="field">
-                <label>VLM Model (可选)</label>
+                <label>{t('VLM Model (可选)')}</label>
                 <input
                   className="input"
                   value={visionModel}
@@ -4675,7 +4830,7 @@ export default function EditorPage() {
                 />
               </div>
               <div className="field">
-                <label>VLM API Key (可选)</label>
+                <label>{t('VLM API Key (可选)')}</label>
                 <input
                   className="input"
                   value={visionApiKey}
@@ -4686,8 +4841,8 @@ export default function EditorPage() {
               </div>
             </div>
             <div className="modal-actions">
-              <button className="btn ghost" onClick={() => setSettingsOpen(false)}>关闭</button>
-              <button className="btn" onClick={() => setSettingsOpen(false)}>完成</button>
+              <button className="btn ghost" onClick={() => setSettingsOpen(false)}>{t('关闭')}</button>
+              <button className="btn" onClick={() => setSettingsOpen(false)}>{t('完成')}</button>
             </div>
           </div>
         </div>
@@ -4696,7 +4851,7 @@ export default function EditorPage() {
         <div className="modal-backdrop" onClick={() => setDiffFocus(null)}>
           <div className="modal diff-modal" onClick={(event) => event.stopPropagation()}>
             <div className="modal-header">
-              <div>Diff · {diffFocus.filePath}</div>
+              <div>{t('Diff')} · {diffFocus.filePath}</div>
               <button className="icon-btn" onClick={() => setDiffFocus(null)}>✕</button>
             </div>
             <div className="modal-body diff-modal-body">

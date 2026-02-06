@@ -12,6 +12,7 @@ import { extractPathFromPatch } from '../utils/diffUtils.js';
 import { resolveLLMConfig, normalizeBaseURL, normalizeChatEndpoint } from './llmService.js';
 import { getProjectRoot } from './projectService.js';
 import { extractArxivId, fetchArxivEntry, buildArxivBibtex } from './arxivService.js';
+import { t } from '../i18n/index.js';
 
 export async function runToolAgent({
   projectId,
@@ -20,10 +21,11 @@ export async function runToolAgent({
   prompt,
   selection,
   compileLog,
-  llmConfig
+  llmConfig,
+  lang = 'zh-CN'
 }) {
   if (!projectId) {
-    return { ok: false, reply: '缺少 projectId，无法使用工具模式。', patches: [] };
+    return { ok: false, reply: t(lang, 'missing_project_id_tools'), patches: [] };
   }
 
   const projectRoot = await getProjectRoot(projectId);

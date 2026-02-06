@@ -6,7 +6,30 @@ import { ensureDir } from '../utils/fsUtils.js';
 import { safeJoin } from '../utils/pathUtils.js';
 import { getProjectRoot } from './projectService.js';
 
-export async function runTectonicCompile({ projectId, mainFile }) {
+const SUPPORTED_ENGINES = ['pdflatex', 'xelatex', 'lualatex', 'latexmk', 'tectonic'];
+
+function buildCommand(engine, outDir, mainFile) {
+  switch (engine) {
+    case 'pdflatex':
+    case 'xelatex':
+    case 'lualatex':
+      return { cmd: engine, args: ['-interaction=nonstopmode', `-output-directory=${outDir}`, mainFile] };
+    case 'latexmk':
+      return { cmd: 'latexmk', args: ['-pdf', '-interaction=nonstopmode', `-outdir=${outDir}`, mainFile] };
+    case 'tectonic':
+      return { cmd: 'tectonic', args: ['--outdir', outDir, mainFile] };
+    default:
+      return null;
+  }
+}
+
+export { SUPPORTED_ENGINES };
+
+export async function runCompile({ projectId, mainFile, engine = 'pdflatex' }) {
+  if (!SUPPORTED_ENGINES.includes(engine)) {
+    return { ok: false, error: `Unsupported engine: ${engine}` };
+  }
+
   const projectRoot = await getProjectRoot(projectId);
   const absMain = safeJoin(projectRoot, mainFile);
   await fs.access(absMain);
@@ -28,13 +51,15 @@ export async function runTectonicCompile({ projectId, mainFile }) {
     logChunks.push(next.slice(0, remaining));
   };
 
+  const { cmd, args } = buildCommand(engine, outDir, mainFile);
+
   return new Promise((resolve) => {
-    const child = spawn('tectonic', ['--outdir', outDir, mainFile], { cwd: projectRoot });
+    const child = spawn(cmd, args, { cwd: projectRoot });
     child.stdout.on('data', pushLog);
     child.stderr.on('data', pushLog);
     child.on('error', async (err) => {
       await fs.rm(outDir, { recursive: true, force: true });
-      resolve({ ok: false, error: `Tectonic not available: ${err.message}` });
+      resolve({ ok: false, error: `${engine} not available: ${err.message}` });
     });
     child.on('close', async (code) => {
       const base = path.basename(mainFile, path.extname(mainFile));

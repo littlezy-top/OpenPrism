@@ -12,6 +12,7 @@ export default function LandingPage() {
   const [charCount, setCharCount] = useState(0);
   const [activeFeature, setActiveFeature] = useState(0);
   const timerRef = useRef<ReturnType<typeof setInterval>>();
+  const [langDropdownOpen, setLangDropdownOpen] = useState(false);
 
   useEffect(() => {
     if (charCount >= TITLE_TEXT.length) return;
@@ -38,14 +39,26 @@ export default function LandingPage() {
     <div className="landing-page">
       {/* Top language selector */}
       <div className="landing-top-bar">
-        <select
-          className="select"
-          value={i18n.language}
-          onChange={(e) => i18n.changeLanguage(e.target.value)}
-        >
-          <option value="zh-CN">{t('中文')}</option>
-          <option value="en-US">{t('English')}</option>
-        </select>
+        <div className="ios-select-wrapper">
+          <button className="ios-select-trigger" onClick={() => setLangDropdownOpen(!langDropdownOpen)}>
+            <span>{i18n.language === 'en-US' ? t('English') : t('中文')}</span>
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className={langDropdownOpen ? 'rotate' : ''}>
+              <path d="M3 5L6 8L9 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+          </button>
+          {langDropdownOpen && (
+            <div className="ios-dropdown dropdown-down">
+              {([['zh-CN', t('中文')], ['en-US', t('English')]] as [string, string][]).map(([val, label]) => (
+                <div key={val} className={`ios-dropdown-item ${i18n.language === val ? 'active' : ''}`} onClick={() => { i18n.changeLanguage(val); setLangDropdownOpen(false); }}>
+                  {label}
+                  {i18n.language === val && (
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8L6.5 11.5L13 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Hero section */}

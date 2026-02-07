@@ -6,9 +6,11 @@ import { ensureDir, readJson } from '../utils/fsUtils.js';
 export async function readTemplateManifest() {
   try {
     const data = await readJson(TEMPLATE_MANIFEST);
-    return Array.isArray(data?.templates) ? data.templates : [];
+    const templates = Array.isArray(data?.templates) ? data.templates : [];
+    const categories = Array.isArray(data?.categories) ? data.categories : [];
+    return { templates, categories };
   } catch {
-    return [];
+    return { templates: [], categories: [] };
   }
 }
 

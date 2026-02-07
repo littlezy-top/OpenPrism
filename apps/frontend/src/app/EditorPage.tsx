@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, Dispatch, MouseEvent, SetStateAction, RefObject, DragEvent } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { basicSetup } from 'codemirror';
 import { latex } from '../latex/lang';
 import { EditorState, StateEffect, StateField } from '@codemirror/state';
@@ -9,7 +11,7 @@ import { Decoration, EditorView, DecorationSet, WidgetType, keymap } from '@code
 import { search, searchKeymap } from '@codemirror/search';
 import { autocompletion, CompletionContext } from '@codemirror/autocomplete';
 import { toggleComment } from '@codemirror/commands';
-import { foldGutter, foldKeymap, foldService, indentOnInput } from '@codemirror/language';
+import { foldKeymap, foldService, indentOnInput } from '@codemirror/language';
 import { GlobalWorkerOptions, getDocument, renderTextLayer } from 'pdfjs-dist';
 import pdfWorker from 'pdfjs-dist/build/pdf.worker.min?url';
 import 'pdfjs-dist/web/pdf_viewer.css';
@@ -84,6 +86,15 @@ const DEFAULT_TASKS = (t: (key: string) => string) => [
   { value: 'translate', label: t('翻译') },
   { value: 'websearch', label: t('检索 (arXiv)') },
   { value: 'custom', label: t('自定义') }
+];
+
+const RIGHT_VIEW_OPTIONS = (t: (key: string) => string) => [
+  { value: 'pdf', label: 'PDF' },
+  { value: 'toc', label: t('目录') },
+  { value: 'figures', label: 'FIG' },
+  { value: 'diff', label: 'DIFF' },
+  { value: 'log', label: 'LOG' },
+  { value: 'review', label: t('评审报告') }
 ];
 
 const SETTINGS_KEY = 'openprism-settings-v1';
@@ -691,7 +702,7 @@ const editorTheme = EditorView.theme(
     },
     '.cm-scroller': {
       fontFamily: '"JetBrains Mono", "SF Mono", "Menlo", monospace',
-      fontSize: '12px',
+      fontSize: 'var(--editor-font-size, 11px)',
       lineHeight: '1.6'
     },
     '.cm-content': {
@@ -1109,6 +1120,18 @@ export default function EditorPage() {
   const [modeDropdownOpen, setModeDropdownOpen] = useState(false);
   const [translateScopeDropdownOpen, setTranslateScopeDropdownOpen] = useState(false);
   const [translateTargetDropdownOpen, setTranslateTargetDropdownOpen] = useState(false);
+  const [rightViewDropdownOpen, setRightViewDropdownOpen] = useState(false);
+  const [mainFileDropdownOpen, setMainFileDropdownOpen] = useState(false);
+  const [engineDropdownOpen, setEngineDropdownOpen] = useState(false);
+  const [langDropdownOpen, setLangDropdownOpen] = useState(false);
+  const [topBarDropdownRect, setTopBarDropdownRect] = useState<{ top: number; left: number; width: number } | null>(null);
+  const [visionModeDropdownOpen, setVisionModeDropdownOpen] = useState(false);
+  const [bibTargetDropdownOpen, setBibTargetDropdownOpen] = useState(false);
+  const [citeTargetDropdownOpen, setCiteTargetDropdownOpen] = useState(false);
+  const [wsBibDropdownOpen, setWsBibDropdownOpen] = useState(false);
+  const [wsTexDropdownOpen, setWsTexDropdownOpen] = useState(false);
+  const [plotTypeDropdownOpen, setPlotTypeDropdownOpen] = useState(false);
+  const [figureDropdownOpen, setFigureDropdownOpen] = useState(false);
   const [pendingChanges, setPendingChanges] = useState<PendingChange[]>([]);
   const [compileLog, setCompileLog] = useState('');
   const [pdfUrl, setPdfUrl] = useState('');
@@ -1125,7 +1148,7 @@ export default function EditorPage() {
   const [isDirty, setIsDirty] = useState(false);
   const [savePulse, setSavePulse] = useState(false);
   const [status, setStatus] = useState<string>('');
-  const [rightView, setRightView] = useState<'pdf' | 'figures' | 'diff' | 'log' | 'toc'>('pdf');
+  const [rightView, setRightView] = useState<'pdf' | 'figures' | 'diff' | 'log' | 'toc' | 'review'>('pdf');
   const [selectedFigure, setSelectedFigure] = useState<string>('');
   const [diffFocus, setDiffFocus] = useState<PendingChange | null>(null);
   const [activeSidebar, setActiveSidebar] = useState<'files' | 'agent' | 'vision' | 'search' | 'websearch' | 'plot' | 'review'>('files');
@@ -1141,7 +1164,9 @@ export default function EditorPage() {
   const [mainFile, setMainFile] = useState('main.tex');
   const [fileFilter, setFileFilter] = useState('');
   const [inlineEdit, setInlineEdit] = useState<InlineEdit | null>(null);
-  const [fileActionsExpanded, setFileActionsExpanded] = useState(false);
+  const [fileContextMenu, setFileContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const [outlineCollapsed, setOutlineCollapsed] = useState(false);
+  const [editorFontSize, setEditorFontSize] = useState(11);
   const [visionMode, setVisionMode] = useState<'equation' | 'table' | 'figure' | 'algorithm' | 'ocr'>('equation');
   const [visionFile, setVisionFile] = useState<File | null>(null);
   const [visionPrompt, setVisionPrompt] = useState('');
@@ -1182,6 +1207,8 @@ export default function EditorPage() {
   const [websearchTargetFile, setWebsearchTargetFile] = useState('');
   const [websearchTargetBib, setWebsearchTargetBib] = useState('');
   const [reviewNotes, setReviewNotes] = useState<{ title: string; content: string }[]>([]);
+  const [reviewReport, setReviewReport] = useState('');
+  const [reviewReportBusy, setReviewReportBusy] = useState(false);
   const [diagnoseBusy, setDiagnoseBusy] = useState(false);
   const [websearchSelectedAll, setWebsearchSelectedAll] = useState(false);
   const editorHostRef = useRef<HTMLDivElement | null>(null);
@@ -1397,7 +1424,6 @@ export default function EditorPage() {
         basicSetup,
         latex(),
         indentOnInput(),
-        foldGutter(),
         foldService.of(latexFoldService),
         EditorView.lineWrapping,
         editorTheme,
@@ -3296,42 +3322,41 @@ export default function EditorPage() {
           <button className="btn ghost" onClick={() => setSidebarOpen((prev) => !prev)}>
             {sidebarOpen ? t('隐藏侧栏') : t('显示侧栏')}
           </button>
-          <select
-            value={mainFile}
-            onChange={(e) => setMainFile(e.target.value)}
-            className="select"
-          >
-            {texFiles.map((path) => (
-              <option key={path} value={path}>
-                {path}
-              </option>
-            ))}
-            {texFiles.length === 0 && <option value="main.tex">main.tex</option>}
-          </select>
-          <select
-            value={compileEngine}
-            onChange={(e) => setSettings((prev) => ({ ...prev, compileEngine: e.target.value as CompileEngine }))}
-            className="select"
-          >
-            <option value="pdflatex">pdfLaTeX</option>
-            <option value="xelatex">XeLaTeX</option>
-            <option value="lualatex">LuaLaTeX</option>
-            <option value="latexmk">Latexmk</option>
-            <option value="tectonic">Tectonic</option>
-          </select>
+          <div className="ios-select-wrapper">
+            <button className="ios-select-trigger" onClick={(e) => {
+              const opening = !mainFileDropdownOpen;
+              setMainFileDropdownOpen(opening); setEngineDropdownOpen(false); setLangDropdownOpen(false);
+              if (opening) { const r = e.currentTarget.getBoundingClientRect(); setTopBarDropdownRect({ top: r.bottom + 6, left: r.left, width: r.width }); }
+            }}>
+              <span>{mainFile}</span>
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className={mainFileDropdownOpen ? 'rotate' : ''}><path d="M3 5L6 8L9 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+            </button>
+          </div>
+          <div className="ios-select-wrapper">
+            <button className="ios-select-trigger" onClick={(e) => {
+              const opening = !engineDropdownOpen;
+              setEngineDropdownOpen(opening); setMainFileDropdownOpen(false); setLangDropdownOpen(false);
+              if (opening) { const r = e.currentTarget.getBoundingClientRect(); setTopBarDropdownRect({ top: r.bottom + 6, left: r.left, width: r.width }); }
+            }}>
+              <span>{({'pdflatex':'pdfLaTeX','xelatex':'XeLaTeX','lualatex':'LuaLaTeX','latexmk':'Latexmk','tectonic':'Tectonic'} as Record<string,string>)[compileEngine] || compileEngine}</span>
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className={engineDropdownOpen ? 'rotate' : ''}><path d="M3 5L6 8L9 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+            </button>
+          </div>
           <button onClick={saveActiveFile} className="btn ghost">{t('保存')}</button>
           <button onClick={compile} className="btn" disabled={isCompiling}>
             {isCompiling ? t('编译中...') : t('编译 PDF')}
           </button>
           <button className="btn ghost" onClick={() => setSettingsOpen(true)}>{t('设置')}</button>
-          <select
-            className="select"
-            value={i18n.language}
-            onChange={(event) => i18n.changeLanguage(event.target.value)}
-          >
-            <option value="zh-CN">{t('中文')}</option>
-            <option value="en-US">{t('English')}</option>
-          </select>
+          <div className="ios-select-wrapper">
+            <button className="ios-select-trigger" onClick={(e) => {
+              const opening = !langDropdownOpen;
+              setLangDropdownOpen(opening); setMainFileDropdownOpen(false); setEngineDropdownOpen(false);
+              if (opening) { const r = e.currentTarget.getBoundingClientRect(); setTopBarDropdownRect({ top: r.bottom + 6, left: r.left, width: r.width }); }
+            }}>
+              <span>{i18n.language === 'zh-CN' ? t('中文') : t('English')}</span>
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className={langDropdownOpen ? 'rotate' : ''}><path d="M3 5L6 8L9 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+            </button>
+          </div>
         </div>
       </header>
 
@@ -3425,36 +3450,7 @@ export default function EditorPage() {
               <>
                 <div className="panel-header">
                   <div>{t('Project Files')}</div>
-                  <button
-                    className="icon-btn"
-                    onClick={() => setFileActionsExpanded(!fileActionsExpanded)}
-                    title={fileActionsExpanded ? t('收起功能') : t('展开功能')}
-                  >
-                    {fileActionsExpanded ? '▲' : '▼'}
-                  </button>
                 </div>
-                {fileActionsExpanded && (
-                  <div className="file-actions">
-                  <div className="action-group">
-                    <div className="action-group-title">{t('创建')}</div>
-                    <button className="btn ghost small" onClick={() => beginInlineCreate('new-file')}>{t('新建文件')}</button>
-                    <button className="btn ghost small" onClick={() => beginInlineCreate('new-folder')}>{t('新建文件夹')}</button>
-                    <button className="btn ghost small" onClick={createBibFile}>{t('新建 Bib')}</button>
-                  </div>
-                  <div className="action-group">
-                    <div className="action-group-title">{t('上传')}</div>
-                    <button className="btn ghost small" onClick={() => fileInputRef.current?.click()}>{t('上传文件')}</button>
-                    <button className="btn ghost small" onClick={() => folderInputRef.current?.click()}>{t('上传文件夹')}</button>
-                  </div>
-                  <div className="action-group">
-                    <div className="action-group-title">{t('操作')}</div>
-                    <button className="btn ghost small" onClick={() => setAllFolders(true)}>{t('展开全部')}</button>
-                    <button className="btn ghost small" onClick={() => setAllFolders(false)}>{t('收起全部')}</button>
-                    <button className="btn ghost small" onClick={beginInlineRename}>{t('重命名')}</button>
-                    <button className="btn ghost small" onClick={() => refreshTree()}>{t('刷新')}</button>
-                  </div>
-                </div>
-                )}
                 <input
                   ref={fileInputRef}
                   type="file"
@@ -3492,6 +3488,14 @@ export default function EditorPage() {
                 <div
                   className="file-tree-body"
                   ref={fileTreeRef}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    const menuH = 380;
+                    const menuW = 180;
+                    const y = event.clientY + menuH > window.innerHeight ? Math.max(8, window.innerHeight - menuH - 8) : event.clientY;
+                    const x = event.clientX + menuW > window.innerWidth ? Math.max(8, window.innerWidth - menuW - 8) : event.clientX;
+                    setFileContextMenu({ x, y });
+                  }}
                   onDragOver={(event) => {
                     event.preventDefault();
                     setDragOverPath('');
@@ -3526,11 +3530,16 @@ export default function EditorPage() {
                   {renderTree(treeRoot.children)}
                 </div>
                 <div className="outline-panel">
-                  <div className="outline-header">
-                    <div>{t('Outline')}</div>
+                  <div className="outline-header" onClick={() => setOutlineCollapsed(!outlineCollapsed)} style={{ cursor: 'pointer' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <svg width="10" height="10" viewBox="0 0 10 10" fill="none" style={{ transform: outlineCollapsed ? 'rotate(-90deg)' : 'rotate(0)', transition: 'transform 0.2s ease' }}>
+                        <path d="M2 3L5 6L8 3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                      </svg>
+                      {t('Outline')}
+                    </div>
                     <div className="muted">{mainFile || 'main.tex'}</div>
                   </div>
-                  {mainFile && mainFile.toLowerCase().endsWith('.tex') ? (
+                  {!outlineCollapsed && (mainFile && mainFile.toLowerCase().endsWith('.tex') ? (
                     outlineItems.length > 0 ? (
                       <div className="outline-list">
                         {outlineItems.map((item, idx) => (
@@ -3561,7 +3570,7 @@ export default function EditorPage() {
                     )
                   ) : (
                     <div className="muted outline-empty">{t('打开 .tex 文件以显示 Outline。')}</div>
-                  )}
+                  ))}
                 </div>
               </>
             ) : activeSidebar === 'agent' ? (
@@ -3602,7 +3611,13 @@ export default function EditorPage() {
                   {(assistantMode === 'chat' ? chatMessages : agentMessages).map((msg, idx) => (
                     <div key={idx} className={`chat-msg ${msg.role}`}>
                       <div className="role">{msg.role}</div>
-                      <div className="content">{msg.content}</div>
+                      <div className={`content ${msg.role === 'assistant' ? 'markdown-body' : ''}`}>
+                        {msg.role === 'assistant' ? (
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+                        ) : (
+                          msg.content
+                        )}
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -3816,20 +3831,22 @@ export default function EditorPage() {
                     <div className="tool-title">{t('图像转 LaTeX')}</div>
                     <div className="field">
                       <label>{t('识别类型')}</label>
-                      <select
-                        className="select"
-                        value={visionMode}
-                        onChange={(event) => {
-                          setVisionMode(event.target.value as 'equation' | 'table' | 'figure' | 'algorithm' | 'ocr');
-                          setVisionResult('');
-                        }}
-                      >
-                        <option value="equation">{t('公式')}</option>
-                        <option value="table">{t('表格')}</option>
-                        <option value="figure">{t('图像 + 图注')}</option>
-                        <option value="algorithm">{t('算法')}</option>
-                        <option value="ocr">{t('仅提取文字')}</option>
-                      </select>
+                      <div className="ios-select-wrapper">
+                        <button className="ios-select-trigger" onClick={() => setVisionModeDropdownOpen(!visionModeDropdownOpen)}>
+                          <span>{({'equation':t('公式'),'table':t('表格'),'figure':t('图像 + 图注'),'algorithm':t('算法'),'ocr':t('仅提取文字')} as Record<string,string>)[visionMode]}</span>
+                          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className={visionModeDropdownOpen ? 'rotate' : ''}><path d="M3 5L6 8L9 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                        </button>
+                        {visionModeDropdownOpen && (
+                          <div className="ios-dropdown dropdown-down">
+                            {([['equation',t('公式')],['table',t('表格')],['figure',t('图像 + 图注')],['algorithm',t('算法')],['ocr',t('仅提取文字')]] as [string,string][]).map(([val,lbl]) => (
+                              <div key={val} className={`ios-dropdown-item ${visionMode === val ? 'active' : ''}`} onClick={() => { setVisionMode(val as 'equation'|'table'|'figure'|'algorithm'|'ocr'); setVisionResult(''); setVisionModeDropdownOpen(false); }}>
+                                {lbl}
+                                {visionMode === val && <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8L6.5 11.5L13 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                     </div>
                     <div className="field">
                       <label>{t('上传图片')}</label>
@@ -3994,16 +4011,26 @@ export default function EditorPage() {
                     )}
                     <div className="field">
                       <label>{t('Bib 文件')}</label>
-                      <select
-                        className="select"
-                        value={bibTarget}
-                        onChange={(event) => setBibTarget(event.target.value)}
-                      >
-                        <option value="">{t('(新建/选择 Bib 文件)')}</option>
-                        {bibFiles.map((path) => (
-                          <option key={path} value={path}>{path}</option>
-                        ))}
-                      </select>
+                      <div className="ios-select-wrapper">
+                        <button className="ios-select-trigger" onClick={() => setBibTargetDropdownOpen(!bibTargetDropdownOpen)}>
+                          <span>{bibTarget || t('(新建/选择 Bib 文件)')}</span>
+                          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className={bibTargetDropdownOpen ? 'rotate' : ''}><path d="M3 5L6 8L9 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                        </button>
+                        {bibTargetDropdownOpen && (
+                          <div className="ios-dropdown dropdown-down">
+                            <div className={`ios-dropdown-item ${bibTarget === '' ? 'active' : ''}`} onClick={() => { setBibTarget(''); setBibTargetDropdownOpen(false); }}>
+                              {t('(新建/选择 Bib 文件)')}
+                              {bibTarget === '' && <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8L6.5 11.5L13 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>}
+                            </div>
+                            {bibFiles.map((p) => (
+                              <div key={p} className={`ios-dropdown-item ${bibTarget === p ? 'active' : ''}`} onClick={() => { setBibTarget(p); setBibTargetDropdownOpen(false); }}>
+                                {p}
+                                {bibTarget === p && <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8L6.5 11.5L13 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                       <button className="btn ghost" onClick={async () => {
                         const created = await createBibFile();
                         if (created) setBibTarget(created);
@@ -4028,15 +4055,22 @@ export default function EditorPage() {
                     {autoInsertToMain && (
                       <div className="field">
                         <label>{t('引用插入目标')}</label>
-                        <select
-                          className="select"
-                          value={citeTargetFile}
-                          onChange={(event) => setCiteTargetFile(event.target.value)}
-                        >
-                          {texFiles.map((path) => (
-                            <option key={path} value={path}>{path}</option>
-                          ))}
-                        </select>
+                        <div className="ios-select-wrapper">
+                          <button className="ios-select-trigger" onClick={() => setCiteTargetDropdownOpen(!citeTargetDropdownOpen)}>
+                            <span>{citeTargetFile || texFiles[0] || 'main.tex'}</span>
+                            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className={citeTargetDropdownOpen ? 'rotate' : ''}><path d="M3 5L6 8L9 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                          </button>
+                          {citeTargetDropdownOpen && (
+                            <div className="ios-dropdown dropdown-down">
+                              {texFiles.map((p) => (
+                                <div key={p} className={`ios-dropdown-item ${citeTargetFile === p ? 'active' : ''}`} onClick={() => { setCiteTargetFile(p); setCiteTargetDropdownOpen(false); }}>
+                                  {p}
+                                  {citeTargetFile === p && <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8L6.5 11.5L13 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
                       </div>
                     )}
                     <div className="row">
@@ -4180,16 +4214,26 @@ export default function EditorPage() {
                     )}
                     <div className="field">
                       <label>{t('Bib 文件')}</label>
-                      <select
-                        className="select"
-                        value={websearchTargetBib}
-                        onChange={(event) => setWebsearchTargetBib(event.target.value)}
-                      >
-                        <option value="">{t('(新建/选择 Bib 文件)')}</option>
-                        {bibFiles.map((path) => (
-                          <option key={path} value={path}>{path}</option>
-                        ))}
-                      </select>
+                      <div className="ios-select-wrapper">
+                        <button className="ios-select-trigger" onClick={() => setWsBibDropdownOpen(!wsBibDropdownOpen)}>
+                          <span>{websearchTargetBib || t('(新建/选择 Bib 文件)')}</span>
+                          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className={wsBibDropdownOpen ? 'rotate' : ''}><path d="M3 5L6 8L9 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                        </button>
+                        {wsBibDropdownOpen && (
+                          <div className="ios-dropdown dropdown-down">
+                            <div className={`ios-dropdown-item ${!websearchTargetBib ? 'active' : ''}`} onClick={() => { setWebsearchTargetBib(''); setWsBibDropdownOpen(false); }}>
+                              {t('(新建/选择 Bib 文件)')}
+                              {!websearchTargetBib && <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8L6.5 11.5L13 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>}
+                            </div>
+                            {bibFiles.map((p) => (
+                              <div key={p} className={`ios-dropdown-item ${websearchTargetBib === p ? 'active' : ''}`} onClick={() => { setWebsearchTargetBib(p); setWsBibDropdownOpen(false); }}>
+                                {p}
+                                {websearchTargetBib === p && <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8L6.5 11.5L13 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                       <button className="btn ghost small" onClick={async () => {
                         const created = await createBibFile();
                         if (created) setWebsearchTargetBib(created);
@@ -4197,15 +4241,26 @@ export default function EditorPage() {
                     </div>
                     <div className="field">
                       <label>{t('插入目标 TeX')}</label>
-                      <select
-                        className="select"
-                        value={websearchTargetFile}
-                        onChange={(event) => setWebsearchTargetFile(event.target.value)}
-                      >
-                        {texFiles.map((path) => (
-                          <option key={path} value={path}>{path}</option>
-                        ))}
-                      </select>
+                      <div className="ios-select-wrapper">
+                        <button className="ios-select-trigger" onClick={() => { setWsTexDropdownOpen(!wsTexDropdownOpen); setWsBibDropdownOpen(false); }}>
+                          <span>{websearchTargetFile || '—'}</span>
+                          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className={wsTexDropdownOpen ? 'rotate' : ''}>
+                            <path d="M3 5L6 8L9 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                          </svg>
+                        </button>
+                        {wsTexDropdownOpen && (
+                          <div className="ios-dropdown dropdown-down">
+                            {texFiles.map((p) => (
+                              <div key={p} className={`ios-dropdown-item ${websearchTargetFile === p ? 'active' : ''}`} onClick={() => { setWebsearchTargetFile(p); setWsTexDropdownOpen(false); }}>
+                                {p}
+                                {websearchTargetFile === p && (
+                                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8L6.5 11.5L13 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                     </div>
                     <div className="row">
                       <button className="btn" onClick={applyWebsearchInsert} disabled={websearchBusy}>
@@ -4226,15 +4281,26 @@ export default function EditorPage() {
                     <div className="muted">{t('从选区表格生成图表（seaborn）')}</div>
                     <div className="field">
                       <label>{t('图表类型')}</label>
-                      <select
-                        className="select"
-                        value={plotType}
-                        onChange={(event) => setPlotType(event.target.value as 'bar' | 'line' | 'heatmap')}
-                      >
-                        <option value="bar">{t('Bar')}</option>
-                        <option value="line">{t('Line')}</option>
-                        <option value="heatmap">{t('Heatmap')}</option>
-                      </select>
+                      <div className="ios-select-wrapper">
+                        <button className="ios-select-trigger" onClick={() => setPlotTypeDropdownOpen(!plotTypeDropdownOpen)}>
+                          <span>{{ bar: t('Bar'), line: t('Line'), heatmap: t('Heatmap') }[plotType]}</span>
+                          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className={plotTypeDropdownOpen ? 'rotate' : ''}>
+                            <path d="M3 5L6 8L9 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                          </svg>
+                        </button>
+                        {plotTypeDropdownOpen && (
+                          <div className="ios-dropdown dropdown-down">
+                            {([['bar', t('Bar')], ['line', t('Line')], ['heatmap', t('Heatmap')]] as [string, string][]).map(([val, label]) => (
+                              <div key={val} className={`ios-dropdown-item ${plotType === val ? 'active' : ''}`} onClick={() => { setPlotType(val as 'bar' | 'line' | 'heatmap'); setPlotTypeDropdownOpen(false); }}>
+                                {label}
+                                {plotType === val && (
+                                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8L6.5 11.5L13 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                     </div>
                     <div className="field">
                       <label>{t('标题 (可选)')}</label>
@@ -4315,6 +4381,39 @@ export default function EditorPage() {
                     <div className="tool-title">{t('质量检查')}</div>
                     <div className="tool-desc">{t('AI 辅助检查论文质量，发现潜在问题')}</div>
                     <div className="review-buttons">
+                      <button
+                        className="review-btn"
+                        onClick={async () => {
+                          if (reviewReportBusy) return;
+                          setReviewReportBusy(true);
+                          setReviewReport(t('生成中...'));
+                          setRightView('review');
+                          try {
+                            const res = await runAgent({
+                              task: 'peer_review',
+                              prompt: t('Read all .tex files in the project (start from the main file and any included sections). Use list_files and read_file tools to inspect content. Write a detailed reviewer-style report. Include: Summary, Strengths, Weaknesses, Questions, Missing Experiments, Writing/Clarity, Suggestions, Score (1-10), and Confidence. Output report text only; do not propose patches or code.'),
+                              selection: '',
+                              content: '',
+                              mode: 'tools',
+                              projectId,
+                              activePath,
+                              compileLog,
+                              llmConfig,
+                              interaction: 'agent',
+                              history: []
+                            });
+                            setReviewReport(res.reply || t('无结果'));
+                          } catch (err) {
+                            setReviewReport(t('生成失败: {{error}}', { error: String(err) }));
+                          } finally {
+                            setReviewReportBusy(false);
+                          }
+                        }}
+                      >
+                        <span className="review-btn-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/></svg></span>
+                        <span className="review-btn-label">{t('详细评审报告')}</span>
+                        <span className="review-btn-desc">{t('阅读项目并输出完整审稿意见')}</span>
+                      </button>
                       <button
                         className="review-btn"
                         onClick={async () => {
@@ -4402,7 +4501,9 @@ export default function EditorPage() {
                       {reviewNotes.map((note, idx) => (
                         <div key={`${note.title}-${idx}`} className="review-item">
                           <div className="review-title">{note.title}</div>
-                          <div className="review-content">{note.content}</div>
+                          <div className="review-content markdown-body">
+                            <ReactMarkdown remarkPlugins={[remarkGfm]}>{note.content}</ReactMarkdown>
+                          </div>
                         </div>
                       ))}
                     </div>
@@ -4456,13 +4557,23 @@ export default function EditorPage() {
               <button className="toolbar-btn" onClick={insertRefSnippet}>{t('Ref')}</button>
               <button className="toolbar-btn" onClick={insertLabelSnippet}>{t('Label')}</button>
             </div>
+            <div className="toolbar-spacer" />
+            <div className="toolbar-group font-size-group">
+              <button className="toolbar-btn icon-only" onClick={() => setEditorFontSize((s) => Math.max(8, s - 1))} title={t('放大')}>
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7h8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
+              </button>
+              <span className="font-size-label">{editorFontSize}px</span>
+              <button className="toolbar-btn icon-only" onClick={() => setEditorFontSize((s) => Math.min(24, s + 1))} title={t('放大')}>
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M7 3v8M3 7h8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
+              </button>
+            </div>
           </div>
           <div
             className="editor-split"
             ref={editorSplitRef}
           >
             <div className="editor-area" ref={editorAreaRef}>
-              <div ref={editorHostRef} className="editor-host" />
+              <div ref={editorHostRef} className="editor-host" style={{ '--editor-font-size': `${editorFontSize}px` } as React.CSSProperties} />
               <div className="editor-hint muted">{t('快捷键: Option/Alt + / 或 Cmd/Ctrl + Space 补全；Cmd/Ctrl + / 注释；Cmd/Ctrl + F 搜索；Cmd/Ctrl + S 保存')}</div>
               {(inlineSuggestionText || isSuggesting) && suggestionPos && (
                 <div
@@ -4498,17 +4609,38 @@ export default function EditorPage() {
           <div className="panel-header">
             <div>{t('Preview')}</div>
             <div className="header-controls">
-              <select
-                className="select"
-                value={rightView}
-                onChange={(event) => setRightView(event.target.value as 'pdf' | 'figures' | 'diff' | 'log' | 'toc')}
-              >
-                <option value="pdf">PDF</option>
-                <option value="toc">{t('目录')}</option>
-                <option value="figures">FIG</option>
-                <option value="diff">DIFF</option>
-                <option value="log">LOG</option>
-              </select>
+              <div className="ios-select-wrapper">
+                <button
+                  className="ios-select-trigger"
+                  onClick={() => setRightViewDropdownOpen(!rightViewDropdownOpen)}
+                >
+                  <span>{RIGHT_VIEW_OPTIONS(t).find((item) => item.value === rightView)?.label || 'PDF'}</span>
+                  <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className={rightViewDropdownOpen ? 'rotate' : ''}>
+                    <path d="M3 5L6 8L9 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                  </svg>
+                </button>
+                {rightViewDropdownOpen && (
+                  <div className="ios-dropdown dropdown-down">
+                    {RIGHT_VIEW_OPTIONS(t).map((item) => (
+                      <div
+                        key={item.value}
+                        className={`ios-dropdown-item ${rightView === item.value ? 'active' : ''}`}
+                        onClick={() => {
+                          setRightView(item.value as 'pdf' | 'figures' | 'diff' | 'log' | 'toc' | 'review');
+                          setRightViewDropdownOpen(false);
+                        }}
+                      >
+                        {item.label}
+                        {rightView === item.value && (
+                          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                            <path d="M3 8L6.5 11.5L13 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                          </svg>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
           <div className="right-body">
@@ -4638,16 +4770,26 @@ export default function EditorPage() {
               {rightView === 'figures' && (
                 <div className="figure-panel-v2">
                   <div className="figure-topbar">
-                    <select
-                      className="figure-select"
-                      value={selectedFigure || ''}
-                      onChange={(e) => setSelectedFigure(e.target.value)}
-                    >
-                      <option value="" disabled>{t('选择图片进行预览。')}</option>
-                      {figureFiles.map((item) => (
-                        <option key={item.path} value={item.path}>{item.path}</option>
-                      ))}
-                    </select>
+                    <div className="ios-select-wrapper" style={{ flex: 1 }}>
+                      <button className="ios-select-trigger" onClick={() => setFigureDropdownOpen(!figureDropdownOpen)}>
+                        <span>{selectedFigure || t('选择图片进行预览。')}</span>
+                        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className={figureDropdownOpen ? 'rotate' : ''}>
+                          <path d="M3 5L6 8L9 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                        </svg>
+                      </button>
+                      {figureDropdownOpen && (
+                        <div className="ios-dropdown dropdown-down">
+                          {figureFiles.map((item) => (
+                            <div key={item.path} className={`ios-dropdown-item ${selectedFigure === item.path ? 'active' : ''}`} onClick={() => { setSelectedFigure(item.path); setFigureDropdownOpen(false); }}>
+                              {item.path}
+                              {selectedFigure === item.path && (
+                                <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8L6.5 11.5L13 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                     {selectedFigure && (
                       <button
                         className="figure-insert-btn"
@@ -4737,10 +4879,77 @@ export default function EditorPage() {
                   <pre className="log-content">{compileLog || t('暂无编译日志')}</pre>
                 </div>
               )}
+              {rightView === 'review' && (
+                <div className="log-panel">
+                  <div className="log-title">{t('评审报告')}</div>
+                  <div className="log-content markdown-body">
+                    {reviewReport ? (
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{reviewReport}</ReactMarkdown>
+                    ) : (
+                      t('暂无评审报告')
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </section>
       </main>
+
+      {/* Top-bar dropdown portals — rendered outside top-bar to escape backdrop-filter stacking context */}
+      {(mainFileDropdownOpen || engineDropdownOpen || langDropdownOpen) && (
+        <div className="topbar-dropdown-backdrop" onClick={() => { setMainFileDropdownOpen(false); setEngineDropdownOpen(false); setLangDropdownOpen(false); }} />
+      )}
+      {mainFileDropdownOpen && topBarDropdownRect && (
+        <div className="ios-dropdown dropdown-fixed" style={{ top: topBarDropdownRect.top, left: topBarDropdownRect.left, minWidth: topBarDropdownRect.width }}>
+          {(texFiles.length > 0 ? texFiles : ['main.tex']).map((p) => (
+            <div key={p} className={`ios-dropdown-item ${mainFile === p ? 'active' : ''}`} onClick={() => { setMainFile(p); setMainFileDropdownOpen(false); }}>
+              {p}
+              {mainFile === p && <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8L6.5 11.5L13 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>}
+            </div>
+          ))}
+        </div>
+      )}
+      {engineDropdownOpen && topBarDropdownRect && (
+        <div className="ios-dropdown dropdown-fixed" style={{ top: topBarDropdownRect.top, left: topBarDropdownRect.left, minWidth: topBarDropdownRect.width }}>
+          {([['pdflatex','pdfLaTeX'],['xelatex','XeLaTeX'],['lualatex','LuaLaTeX'],['latexmk','Latexmk'],['tectonic','Tectonic']] as [string,string][]).map(([val, lbl]) => (
+            <div key={val} className={`ios-dropdown-item ${compileEngine === val ? 'active' : ''}`} onClick={() => { setSettings((prev) => ({ ...prev, compileEngine: val as CompileEngine })); setEngineDropdownOpen(false); }}>
+              {lbl}
+              {compileEngine === val && <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8L6.5 11.5L13 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>}
+            </div>
+          ))}
+        </div>
+      )}
+      {langDropdownOpen && topBarDropdownRect && (
+        <div className="ios-dropdown dropdown-fixed" style={{ top: topBarDropdownRect.top, left: topBarDropdownRect.left, minWidth: topBarDropdownRect.width }}>
+          {[['zh-CN', t('中文')], ['en-US', t('English')]].map(([val, lbl]) => (
+            <div key={val} className={`ios-dropdown-item ${i18n.language === val ? 'active' : ''}`} onClick={() => { i18n.changeLanguage(val); setLangDropdownOpen(false); }}>
+              {lbl}
+              {i18n.language === val && <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8L6.5 11.5L13 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {fileContextMenu && (
+        <div className="ctx-menu-backdrop" onClick={() => setFileContextMenu(null)} onContextMenu={(e) => { e.preventDefault(); setFileContextMenu(null); }}>
+          <div className="ctx-menu" style={{ left: fileContextMenu.x, top: fileContextMenu.y }} onClick={(e) => e.stopPropagation()}>
+            <div className="ctx-menu-group">{t('创建')}</div>
+            <button className="ctx-menu-item" onClick={() => { beginInlineCreate('new-file'); setFileContextMenu(null); }}>{t('新建文件')}</button>
+            <button className="ctx-menu-item" onClick={() => { beginInlineCreate('new-folder'); setFileContextMenu(null); }}>{t('新建文件夹')}</button>
+            <button className="ctx-menu-item" onClick={() => { createBibFile(); setFileContextMenu(null); }}>{t('新建 Bib')}</button>
+            <div className="ctx-menu-sep" />
+            <div className="ctx-menu-group">{t('上传')}</div>
+            <button className="ctx-menu-item" onClick={() => { fileInputRef.current?.click(); setFileContextMenu(null); }}>{t('上传文件')}</button>
+            <button className="ctx-menu-item" onClick={() => { folderInputRef.current?.click(); setFileContextMenu(null); }}>{t('上传文件夹')}</button>
+            <div className="ctx-menu-sep" />
+            <button className="ctx-menu-item" onClick={() => { setAllFolders(true); setFileContextMenu(null); }}>{t('展开全部')}</button>
+            <button className="ctx-menu-item" onClick={() => { setAllFolders(false); setFileContextMenu(null); }}>{t('收起全部')}</button>
+            <button className="ctx-menu-item" onClick={() => { beginInlineRename(); setFileContextMenu(null); }}>{t('重命名')}</button>
+            <button className="ctx-menu-item" onClick={() => { refreshTree(); setFileContextMenu(null); }}>{t('刷新')}</button>
+          </div>
+        </div>
+      )}
       {settingsOpen && (
         <div className="modal-backdrop" onClick={() => setSettingsOpen(false)}>
           <div className="modal" onClick={(event) => event.stopPropagation()}>

@@ -23,7 +23,14 @@ export function registerProjectRoutes(fastify) {
       const metaPath = path.join(DATA_DIR, entry.name, 'project.json');
       try {
         const meta = await readJson(metaPath);
-        projects.push(meta);
+        projects.push({
+          ...meta,
+          updatedAt: meta.updatedAt || meta.createdAt,
+          tags: meta.tags || [],
+          archived: meta.archived || false,
+          trashed: meta.trashed || false,
+          trashedAt: meta.trashedAt || null
+        });
       } catch {
         // ignore
       }
@@ -171,11 +178,81 @@ export function registerProjectRoutes(fastify) {
     return { ok: true, project: next };
   });
 
+  fastify.post('/api/projects/:id/copy', async (req) => {
+    const { id } = req.params;
+    const { name } = req.body || {};
+    const srcRoot = await getProjectRoot(id);
+    const srcMeta = await readJson(path.join(srcRoot, 'project.json'));
+    const newId = crypto.randomUUID();
+    const destRoot = path.join(DATA_DIR, newId);
+    await copyDir(srcRoot, destRoot);
+    const newMeta = {
+      ...srcMeta,
+      id: newId,
+      name: name || `${srcMeta.name} (Copy)`,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      trashed: false,
+      trashedAt: null,
+    };
+    await writeJson(path.join(destRoot, 'project.json'), newMeta);
+    return { ok: true, project: newMeta };
+  });
+
   fastify.delete('/api/projects/:id', async (req) => {
+    const { id } = req.params;
+    const projectRoot = await getProjectRoot(id);
+    const metaPath = path.join(projectRoot, 'project.json');
+    const meta = await readJson(metaPath);
+    const next = { ...meta, trashed: true, trashedAt: new Date().toISOString() };
+    await writeJson(metaPath, next);
+    return { ok: true };
+  });
+
+  fastify.delete('/api/projects/:id/permanent', async (req) => {
     const { id } = req.params;
     const projectRoot = await getProjectRoot(id);
     await fs.rm(projectRoot, { recursive: true, force: true });
     return { ok: true };
+  });
+
+  fastify.patch('/api/projects/:id/tags', async (req) => {
+    const { id } = req.params;
+    const { tags } = req.body || {};
+    if (!Array.isArray(tags)) return { ok: false, error: 'tags must be an array' };
+    const projectRoot = await getProjectRoot(id);
+    const metaPath = path.join(projectRoot, 'project.json');
+    const meta = await readJson(metaPath);
+    const next = { ...meta, tags, updatedAt: new Date().toISOString() };
+    await writeJson(metaPath, next);
+    return { ok: true, project: next };
+  });
+
+  fastify.patch('/api/projects/:id/archive', async (req) => {
+    const { id } = req.params;
+    const { archived } = req.body || {};
+    const projectRoot = await getProjectRoot(id);
+    const metaPath = path.join(projectRoot, 'project.json');
+    const meta = await readJson(metaPath);
+    const next = { ...meta, archived: !!archived, updatedAt: new Date().toISOString() };
+    await writeJson(metaPath, next);
+    return { ok: true, project: next };
+  });
+
+  fastify.patch('/api/projects/:id/trash', async (req) => {
+    const { id } = req.params;
+    const { trashed } = req.body || {};
+    const projectRoot = await getProjectRoot(id);
+    const metaPath = path.join(projectRoot, 'project.json');
+    const meta = await readJson(metaPath);
+    const next = {
+      ...meta,
+      trashed: !!trashed,
+      trashedAt: trashed ? new Date().toISOString() : null,
+      updatedAt: new Date().toISOString()
+    };
+    await writeJson(metaPath, next);
+    return { ok: true, project: next };
   });
 
   fastify.get('/api/projects/:id/tree', async (req) => {
@@ -262,6 +339,12 @@ export function registerProjectRoutes(fastify) {
     const abs = safeJoin(projectRoot, filePath);
     await ensureDir(path.dirname(abs));
     await fs.writeFile(abs, content ?? '', 'utf8');
+    try {
+      const metaPath = path.join(projectRoot, 'project.json');
+      const meta = await readJson(metaPath);
+      meta.updatedAt = new Date().toISOString();
+      await writeJson(metaPath, meta);
+    } catch { /* ignore */ }
     return { ok: true };
   });
 
@@ -287,7 +370,7 @@ export function registerProjectRoutes(fastify) {
     const { id } = req.params;
     const { targetTemplate, mainFile = 'main.tex' } = req.body || {};
     if (!targetTemplate) return { ok: false, error: 'Missing targetTemplate' };
-    const templates = await readTemplateManifest();
+    const { templates } = await readTemplateManifest();
     const template = templates.find((item) => item.id === targetTemplate);
     if (!template) return { ok: false, error: 'Unknown template' };
 

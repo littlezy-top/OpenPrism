@@ -3,22 +3,49 @@ import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import {
   createProject,
+  copyProject,
   deleteProject,
   importArxivSSE,
   importZip,
   listProjects,
   listTemplates,
   renameProject,
-  convertTemplate
+  archiveProject,
+  trashProject,
+  updateProjectTags,
+  permanentDeleteProject
 } from '../api/client';
+import type { ProjectMeta, TemplateMeta, TemplateCategory } from '../api/client';
+
+type ViewFilter = 'all' | 'mine' | 'archived' | 'trash';
+type SortBy = 'updatedAt' | 'name' | 'createdAt';
+
+function formatRelativeTime(iso: string, t: (k: string, o?: Record<string, unknown>) => string): string {
+  const now = Date.now();
+  const then = new Date(iso).getTime();
+  const diff = now - then;
+  if (diff < 60_000) return t('刚刚');
+  if (diff < 3_600_000) return t('{{n}} 分钟前', { n: Math.floor(diff / 60_000) });
+  if (diff < 86_400_000) return t('{{n}} 小时前', { n: Math.floor(diff / 3_600_000) });
+  return t('{{n}} 天前', { n: Math.floor(diff / 86_400_000) });
+}
 
 export default function ProjectPage() {
   const navigate = useNavigate();
   const { t, i18n } = useTranslation();
-  const [projects, setProjects] = useState<{ id: string; name: string; createdAt: string }[]>([]);
-  const [templates, setTemplates] = useState<{ id: string; label: string; mainFile: string }[]>([]);
+
+  const [projects, setProjects] = useState<ProjectMeta[]>([]);
+  const [templates, setTemplates] = useState<TemplateMeta[]>([]);
+  const [categories, setCategories] = useState<TemplateCategory[]>([]);
   const [status, setStatus] = useState('');
   const [filter, setFilter] = useState('');
+
+  const [viewFilter, setViewFilter] = useState<ViewFilter>('all');
+  const [activeTag, setActiveTag] = useState<string | null>(null);
+  const [sortBy, setSortBy] = useState<SortBy>('updatedAt');
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [tagsExpanded, setTagsExpanded] = useState(true);
+
   const [createOpen, setCreateOpen] = useState(false);
   const [createName, setCreateName] = useState('');
   const [createTemplate, setCreateTemplate] = useState('');
@@ -27,9 +54,19 @@ export default function ProjectPage() {
   const [arxivInput, setArxivInput] = useState('');
   const [importing, setImporting] = useState(false);
   const [importProgress, setImportProgress] = useState<{ phase: string; percent: number } | null>(null);
-  const [templateMap, setTemplateMap] = useState<Record<string, string>>({});
-  const [mainFileMap, setMainFileMap] = useState<Record<string, string>>({});
   const zipInputRef = useRef<HTMLInputElement | null>(null);
+  const [langDropdownOpen, setLangDropdownOpen] = useState(false);
+  const [templateDropdownOpen, setTemplateDropdownOpen] = useState(false);
+
+  const [templateGalleryOpen, setTemplateGalleryOpen] = useState(false);
+  const [galleryCat, setGalleryCat] = useState('all');
+  const [galleryFeatured, setGalleryFeatured] = useState(false);
+  const [gallerySearch, setGallerySearch] = useState('');
+  const [tagEditId, setTagEditId] = useState<string | null>(null);
+  const [tagInput, setTagInput] = useState('');
+  const [newSidebarTag, setNewSidebarTag] = useState('');
+  const [addingSidebarTag, setAddingSidebarTag] = useState(false);
+  const [sortDropdownOpen, setSortDropdownOpen] = useState(false);
 
   const loadProjects = useCallback(async () => {
     const res = await listProjects();
@@ -44,6 +81,7 @@ export default function ProjectPage() {
     listTemplates()
       .then((res) => {
         setTemplates(res.templates || []);
+        setCategories(res.categories || []);
         if (res.templates?.length && !createTemplate) {
           setCreateTemplate(res.templates[0].id);
         }
@@ -51,11 +89,48 @@ export default function ProjectPage() {
       .catch((err) => setStatus(t('模板加载失败: {{error}}', { error: String(err) })));
   }, [createTemplate, t]);
 
+  const allTags = useMemo(() => {
+    const s = new Set<string>();
+    projects.forEach((p) => (p.tags || []).forEach((tag) => s.add(tag)));
+    return Array.from(s).sort();
+  }, [projects]);
+
   const filteredProjects = useMemo(() => {
+    let list = projects;
+    if (viewFilter === 'archived') list = list.filter((p) => p.archived && !p.trashed);
+    else if (viewFilter === 'trash') list = list.filter((p) => p.trashed);
+    else if (viewFilter === 'mine') list = list.filter((p) => !p.archived && !p.trashed);
+    else list = list.filter((p) => !p.trashed);
+    if (activeTag) list = list.filter((p) => (p.tags || []).includes(activeTag));
     const term = filter.trim().toLowerCase();
-    if (!term) return projects;
-    return projects.filter((item) => item.name.toLowerCase().includes(term));
-  }, [filter, projects]);
+    if (term) list = list.filter((p) => p.name.toLowerCase().includes(term));
+    list = [...list].sort((a, b) => {
+      if (sortBy === 'name') return a.name.localeCompare(b.name);
+      if (sortBy === 'createdAt') return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+      return new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime();
+    });
+    return list;
+  }, [projects, viewFilter, activeTag, filter, sortBy]);
+
+  const viewCounts = useMemo(() => ({
+    all: projects.filter((p) => !p.trashed).length,
+    mine: projects.filter((p) => !p.archived && !p.trashed).length,
+    archived: projects.filter((p) => p.archived && !p.trashed).length,
+    trash: projects.filter((p) => p.trashed).length,
+  }), [projects]);
+
+  const galleryTemplates = useMemo(() => {
+    let list = templates;
+    if (galleryCat !== 'all') list = list.filter((tpl) => tpl.category === galleryCat);
+    if (galleryFeatured) list = list.filter((tpl) => tpl.featured);
+    const term = gallerySearch.trim().toLowerCase();
+    if (term) list = list.filter((tpl) =>
+      tpl.label.toLowerCase().includes(term) ||
+      (tpl.description || '').toLowerCase().includes(term) ||
+      (tpl.descriptionEn || '').toLowerCase().includes(term)
+    );
+    return list;
+  }, [templates, galleryCat, galleryFeatured, gallerySearch]);
 
   const handleCreate = async () => {
     const name = createName.trim();
@@ -97,6 +172,91 @@ export default function ProjectPage() {
       await loadProjects();
     } catch (err) {
       setStatus(t('删除失败: {{error}}', { error: String(err) }));
+    }
+  };
+
+  const handleArchive = async (id: string, archived: boolean) => {
+    try {
+      await archiveProject(id, archived);
+      await loadProjects();
+    } catch (err) {
+      setStatus(t('操作失败: {{error}}', { error: String(err) }));
+    }
+  };
+
+  const handleTrash = async (id: string, trashed: boolean) => {
+    try {
+      await trashProject(id, trashed);
+      await loadProjects();
+    } catch (err) {
+      setStatus(t('操作失败: {{error}}', { error: String(err) }));
+    }
+  };
+
+  const handlePermanentDelete = async (id: string, name: string) => {
+    if (!window.confirm(t('确定永久删除项目 {{name}}？此操作不可撤销。', { name }))) return;
+    try {
+      await permanentDeleteProject(id);
+      await loadProjects();
+    } catch (err) {
+      setStatus(t('删除失败: {{error}}', { error: String(err) }));
+    }
+  };
+
+  const handleEmptyTrash = async () => {
+    if (!window.confirm(t('确定清空回收站？所有项目将被永久删除。'))) return;
+    const trashItems = projects.filter((p) => p.trashed);
+    for (const p of trashItems) {
+      try { await permanentDeleteProject(p.id); } catch {}
+    }
+    await loadProjects();
+  };
+
+  const handleAddTag = async (id: string, tag: string) => {
+    const proj = projects.find((p) => p.id === id);
+    if (!proj) return;
+    const tags = [...new Set([...(proj.tags || []), tag])];
+    try {
+      await updateProjectTags(id, tags);
+      await loadProjects();
+    } catch (err) {
+      setStatus(t('操作失败: {{error}}', { error: String(err) }));
+    }
+  };
+
+  const handleRemoveTag = async (id: string, tag: string) => {
+    const proj = projects.find((p) => p.id === id);
+    if (!proj) return;
+    const tags = (proj.tags || []).filter((t) => t !== tag);
+    try {
+      await updateProjectTags(id, tags);
+      await loadProjects();
+    } catch (err) {
+      setStatus(t('操作失败: {{error}}', { error: String(err) }));
+    }
+  };
+
+  const handleCreateFromTemplate = async (tplId: string) => {
+    const tpl = templates.find((t) => t.id === tplId);
+    const name = createName.trim() || tpl?.label || 'Untitled';
+    try {
+      const created = await createProject({ name, template: tplId });
+      setTemplateGalleryOpen(false);
+      setCreateName('');
+      await loadProjects();
+      navigate(`/editor/${created.id}`);
+    } catch (err) {
+      setStatus(t('创建失败: {{error}}', { error: String(err) }));
+    }
+  };
+
+  const handleCopy = async (id: string, originalName: string) => {
+    try {
+      const res = await copyProject(id, `${originalName} (Copy)`);
+      if (!res.ok || !res.project) throw new Error(res.error || 'Copy failed');
+      await loadProjects();
+    } catch (err) {
+      setStatus(t('复制失败: {{error}}', { error: String(err) }));
     }
   };
 
@@ -144,114 +304,283 @@ export default function ProjectPage() {
     }
   };
 
-  const handleConvertTemplate = async (projectId: string) => {
-    const templateId = templateMap[projectId] || templates[0]?.id;
-    if (!templateId) {
-      setStatus(t('暂无模板可用。'));
-      return;
-    }
-    const mainFile = mainFileMap[projectId] || 'main.tex';
-    setStatus(t('正在转换模板...'));
-    try {
-      const res = await convertTemplate({ projectId, targetTemplate: templateId, mainFile });
-      if (!res.ok) {
-        throw new Error(res.error || t('模板转换失败'));
-      }
-      setStatus(t('模板已切换为 {{template}}', { template: templateId }));
-    } catch (err) {
-      setStatus(t('模板转换失败: {{error}}', { error: String(err) }));
-    }
+
+  const navIcons: Record<ViewFilter, React.ReactNode> = {
+    all: <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"><path d="M2 4.5h12M2 4.5v8a1 1 0 001 1h10a1 1 0 001-1v-8M2 4.5l1.5-2h9l1.5 2"/></svg>,
+    mine: <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"><path d="M9 2H4.5a1 1 0 00-1 1v10a1 1 0 001 1h7a1 1 0 001-1V5.5L9 2z"/><path d="M9 2v3.5h3.5M6 8.5h4M6 11h2.5"/></svg>,
+    archived: <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="2.5" width="12" height="3" rx=".5"/><path d="M3 5.5v7.5a1 1 0 001 1h8a1 1 0 001-1V5.5"/><path d="M6.5 8.5h3"/></svg>,
+    trash: <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"><path d="M3 4.5h10M6 4.5V3a1 1 0 011-1h2a1 1 0 011 1v1.5"/><path d="M4.5 4.5l.5 8.5a1 1 0 001 1h4a1 1 0 001-1l.5-8.5"/></svg>,
   };
+  const navItems: { key: ViewFilter; label: string }[] = [
+    { key: 'all', label: t('所有项目') },
+    { key: 'mine', label: t('我的项目') },
+    { key: 'archived', label: t('已归档') },
+    { key: 'trash', label: t('回收站') },
+  ];
 
   return (
-    <div className="app-shell">
-      <header className="top-bar">
-        <div className="brand">
+    <div className="project-shell">
+      {/* ── Sidebar ── */}
+      <aside className="project-sidebar">
+        <div className="sidebar-brand">
           <div className="brand-title">OpenPrism</div>
           <div className="brand-sub">{t('Projects Workspace')}</div>
         </div>
-        <div className="toolbar">
-          <button className="btn ghost" onClick={() => setCreateOpen(true)}>{t('新建项目')}</button>
-          <button className="btn ghost" onClick={() => setImportOpen(true)}>{t('导入项目')}</button>
-          <select
-            className="select"
-            value={i18n.language}
-            onChange={(event) => i18n.changeLanguage(event.target.value)}
-          >
-            <option value="zh-CN">{t('中文')}</option>
-            <option value="en-US">{t('English')}</option>
-          </select>
-        </div>
-      </header>
 
-      <div className="status-bar">
-        <div>{status}</div>
-      </div>
-
-      <main className="project-page">
-        <div className="panel-search">
-          <input
-            className="input"
-            value={filter}
-            onChange={(event) => setFilter(event.target.value)}
-            placeholder={t('搜索项目...')}
-          />
+        <button className="sidebar-create-btn" onClick={() => setCreateOpen(true)}>
+          + {t('新建项目')}
+        </button>
+        <div className="sidebar-actions-row">
+          <button className="btn ghost" style={{ flex: 1 }} onClick={() => setImportOpen(true)}>{t('导入项目')}</button>
+          <button className="btn ghost" style={{ flex: 1 }} onClick={() => setTemplateGalleryOpen(true)}>{t('模板库')}</button>
         </div>
-        <div className="project-grid">
-          {filteredProjects.map((project) => (
-            <div key={project.id} className="project-card">
-              {renameState?.id === project.id ? (
-                <input
-                  className="inline-input"
-                  autoFocus
-                  value={renameState.value}
-                  onChange={(event) => setRenameState({ ...renameState, value: event.target.value })}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter') {
-                      event.preventDefault();
-                      handleRename();
-                    }
-                    if (event.key === 'Escape') {
-                      event.preventDefault();
-                      setRenameState(null);
-                    }
-                  }}
-                  onBlur={() => setRenameState(null)}
-                />
-              ) : (
-                <div className="project-title">{project.name}</div>
-              )}
-              <div className="project-meta">{new Date(project.createdAt).toLocaleString()}</div>
-              <div className="project-actions">
-                <button className="btn" onClick={() => navigate(`/editor/${project.id}`)}>{t('打开')}</button>
-                <button className="btn ghost" onClick={() => setRenameState({ id: project.id, value: project.name })}>{t('重命名')}</button>
-                <button className="btn ghost" onClick={() => handleDelete(project.id, project.name)}>{t('删除')}</button>
-              </div>
-              <div className="project-convert">
-                <select
-                  className="select"
-                  value={templateMap[project.id] || templates[0]?.id || ''}
-                  onChange={(event) => setTemplateMap((prev) => ({ ...prev, [project.id]: event.target.value }))}
-                >
-                  {templates.map((tpl) => (
-                    <option key={tpl.id} value={tpl.id}>{tpl.label}</option>
-                  ))}
-                </select>
-                <input
-                  className="input"
-                  value={mainFileMap[project.id] || 'main.tex'}
-                  onChange={(event) => setMainFileMap((prev) => ({ ...prev, [project.id]: event.target.value }))}
-                  placeholder="main.tex"
-                />
-                <button className="btn ghost" onClick={() => handleConvertTemplate(project.id)}>{t('转换模板')}</button>
-              </div>
+
+        <nav className="sidebar-nav">
+          {navItems.map((item) => (
+            <div
+              key={item.key}
+              className={`sidebar-nav-item${viewFilter === item.key && !activeTag ? ' active' : ''}`}
+              onClick={() => { setViewFilter(item.key); setActiveTag(null); }}
+            >
+              <span className="sidebar-nav-icon">{navIcons[item.key]}</span>
+              <span className="sidebar-nav-label">{item.label}</span>
+              <span className="sidebar-nav-count">{viewCounts[item.key]}</span>
             </div>
           ))}
-          {filteredProjects.length === 0 && (
-            <div className="muted">{t('暂无项目。')}</div>
+        </nav>
+
+        <div className="sidebar-tags-section">
+          <div className="sidebar-tags-header" onClick={() => setTagsExpanded(!tagsExpanded)}>
+            <span>{tagsExpanded ? '\u25BE' : '\u25B8'} {t('整理标签')}</span>
+          </div>
+          {tagsExpanded && (
+            <div className="sidebar-tags-list">
+              {allTags.map((tag) => (
+                <div
+                  key={tag}
+                  className={`sidebar-tag-item${activeTag === tag ? ' active' : ''}`}
+                  onClick={() => setActiveTag(activeTag === tag ? null : tag)}
+                >
+                  <span className="tag-dot" />
+                  <span>{tag}</span>
+                </div>
+              ))}
+              {addingSidebarTag ? (
+                <input
+                  className="sidebar-tag-input"
+                  autoFocus
+                  value={newSidebarTag}
+                  onChange={(e) => setNewSidebarTag(e.target.value)}
+                  placeholder={t('输入标签名称')}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && newSidebarTag.trim()) {
+                      setAddingSidebarTag(false);
+                      setNewSidebarTag('');
+                    }
+                    if (e.key === 'Escape') { setAddingSidebarTag(false); setNewSidebarTag(''); }
+                  }}
+                  onBlur={() => { setAddingSidebarTag(false); setNewSidebarTag(''); }}
+                />
+              ) : (
+                <div className="sidebar-new-tag-btn" onClick={() => setAddingSidebarTag(true)}>
+                  + {t('新建标签')}
+                </div>
+              )}
+            </div>
           )}
         </div>
-      </main>
+      </aside>
+
+      {/* ── Main Content ── */}
+      <div className="project-main">
+        <header className="project-main-header">
+          <h1 className="project-main-title">
+            {activeTag ? `${t('标签')}: ${activeTag}` : navItems.find((n) => n.key === viewFilter)?.label || t('所有项目')}
+          </h1>
+          <div className="project-main-header-actions">
+            {viewFilter === 'trash' && viewCounts.trash > 0 && (
+              <button className="btn ghost" onClick={handleEmptyTrash}>{t('清空回收站')}</button>
+            )}
+            <div className="ios-select-wrapper">
+              <button className="ios-select-trigger" onClick={() => setLangDropdownOpen(!langDropdownOpen)}>
+                <span>{i18n.language === 'en-US' ? t('English') : t('中文')}</span>
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className={langDropdownOpen ? 'rotate' : ''}>
+                  <path d="M3 5L6 8L9 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                </svg>
+              </button>
+              {langDropdownOpen && (
+                <div className="ios-dropdown dropdown-down">
+                  {([['zh-CN', t('中文')], ['en-US', t('English')]] as [string, string][]).map(([val, label]) => (
+                    <div key={val} className={`ios-dropdown-item ${i18n.language === val ? 'active' : ''}`} onClick={() => { i18n.changeLanguage(val); setLangDropdownOpen(false); }}>
+                      {label}
+                      {i18n.language === val && (
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8L6.5 11.5L13 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </header>
+
+        {status && <div className="status-bar"><div>{status}</div></div>}
+
+        <div className="project-toolbar">
+          <input
+            className="project-search"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            placeholder={t('搜索项目...')}
+          />
+          <div className="ios-select-wrapper">
+            <button className="ios-select-trigger" onClick={() => setSortDropdownOpen(!sortDropdownOpen)}>
+              <span>{sortBy === 'updatedAt' ? t('最近修改') : sortBy === 'name' ? t('按名称') : t('创建时间')}</span>
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className={sortDropdownOpen ? 'rotate' : ''}>
+                <path d="M3 5L6 8L9 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+            </button>
+            {sortDropdownOpen && (
+              <div className="ios-dropdown dropdown-down">
+                {([['updatedAt', t('最近修改')], ['name', t('按名称')], ['createdAt', t('创建时间')]] as [SortBy, string][]).map(([val, label]) => (
+                  <div key={val} className={`ios-dropdown-item ${sortBy === val ? 'active' : ''}`} onClick={() => { setSortBy(val); setSortDropdownOpen(false); }}>
+                    {label}
+                    {sortBy === val && (
+                      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8L6.5 11.5L13 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* ── Project Table ── */}
+        <div className="project-table-wrapper">
+          <table className="project-table">
+            <thead>
+              <tr>
+                <th className="col-check">
+                  <input
+                    type="checkbox"
+                    checked={filteredProjects.length > 0 && selectedIds.size === filteredProjects.length}
+                    onChange={(e) => {
+                      if (e.target.checked) setSelectedIds(new Set(filteredProjects.map((p) => p.id)));
+                      else setSelectedIds(new Set());
+                    }}
+                  />
+                </th>
+                <th className="col-name">{t('名称')}</th>
+                <th className="col-tags">{t('标签')}</th>
+                <th className="col-modified">{t('最后修改')}</th>
+                <th className="col-actions">{t('操作')}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredProjects.map((project) => (
+                <tr key={project.id} className={`project-table-row${selectedIds.has(project.id) ? ' selected' : ''}`}>
+                  <td className="col-check">
+                    <input
+                      type="checkbox"
+                      checked={selectedIds.has(project.id)}
+                      onChange={(e) => {
+                        const next = new Set(selectedIds);
+                        if (e.target.checked) next.add(project.id); else next.delete(project.id);
+                        setSelectedIds(next);
+                      }}
+                    />
+                  </td>
+                  <td className="col-name">
+                    {renameState?.id === project.id ? (
+                      <input
+                        className="inline-input"
+                        autoFocus
+                        value={renameState.value}
+                        onChange={(e) => setRenameState({ ...renameState, value: e.target.value })}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') { e.preventDefault(); handleRename(); }
+                          if (e.key === 'Escape') { e.preventDefault(); setRenameState(null); }
+                        }}
+                        onBlur={() => setRenameState(null)}
+                      />
+                    ) : (
+                      <span className="project-name-link" onClick={() => navigate(`/editor/${project.id}`)}>
+                        {project.name}
+                      </span>
+                    )}
+                  </td>
+                  <td className="col-tags">
+                    <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap', alignItems: 'center' }}>
+                      {(project.tags || []).map((tag) => (
+                        <span key={tag} className="project-tag-pill" onClick={() => setActiveTag(tag)}>
+                          {tag}
+                          {viewFilter !== 'trash' && (
+                            <span style={{ marginLeft: 4, cursor: 'pointer' }} onClick={(e) => { e.stopPropagation(); handleRemoveTag(project.id, tag); }}>&times;</span>
+                          )}
+                        </span>
+                      ))}
+                      {viewFilter !== 'trash' && (
+                        tagEditId === project.id ? (
+                          <input
+                            className="sidebar-tag-input"
+                            style={{ width: 80, fontSize: 12 }}
+                            autoFocus
+                            value={tagInput}
+                            onChange={(e) => setTagInput(e.target.value)}
+                            placeholder={t('添加标签')}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter' && tagInput.trim()) {
+                                handleAddTag(project.id, tagInput.trim());
+                                setTagInput('');
+                                setTagEditId(null);
+                              }
+                              if (e.key === 'Escape') { setTagEditId(null); setTagInput(''); }
+                            }}
+                            onBlur={() => { setTagEditId(null); setTagInput(''); }}
+                          />
+                        ) : (
+                          <span
+                            className="project-tag-pill"
+                            style={{ cursor: 'pointer', opacity: 0.5 }}
+                            onClick={() => { setTagEditId(project.id); setTagInput(''); }}
+                          >+</span>
+                        )
+                      )}
+                    </div>
+                  </td>
+                  <td className="col-modified">
+                    {formatRelativeTime(project.updatedAt || project.createdAt, t)}
+                  </td>
+                  <td className="col-actions">
+                    <div className="col-actions-inner">
+                      {viewFilter === 'trash' ? (<>
+                        <button className="btn ghost" onClick={() => handleTrash(project.id, false)}>{t('恢复')}</button>
+                        <button className="btn ghost" onClick={() => handlePermanentDelete(project.id, project.name)}>{t('永久删除')}</button>
+                      </>) : (<>
+                        <button className="btn ghost" onClick={() => navigate(`/editor/${project.id}`)}>{t('打开')}</button>
+                        <button className="btn ghost" onClick={() => setRenameState({ id: project.id, value: project.name })}>{t('重命名')}</button>
+                        <button className="btn ghost" onClick={() => handleCopy(project.id, project.name)}>{t('复制')}</button>
+                        {project.archived
+                          ? <button className="btn ghost" onClick={() => handleArchive(project.id, false)}>{t('取消归档')}</button>
+                          : <button className="btn ghost" onClick={() => handleArchive(project.id, true)}>{t('归档')}</button>
+                        }
+                        <button className="btn ghost" onClick={() => handleDelete(project.id, project.name)}>{t('删除')}</button>
+                      </>)}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {filteredProjects.length === 0 && (
+            <div className="project-table-empty">{t('暂无项目。')}</div>
+          )}
+        </div>
+
+        <div className="project-footer">
+          {t('显示 {{shown}} / {{total}} 个项目', { shown: filteredProjects.length, total: projects.length })}
+        </div>
+      </div>
 
       <input
         ref={zipInputRef}
@@ -288,15 +617,26 @@ export default function ProjectPage() {
               </div>
               <div className="field">
                 <label>{t('模板')}</label>
-                <select
-                  className="select"
-                  value={createTemplate}
-                  onChange={(event) => setCreateTemplate(event.target.value)}
-                >
-                  {templates.map((tpl) => (
-                    <option key={tpl.id} value={tpl.id}>{tpl.label}</option>
-                  ))}
-                </select>
+                <div className="ios-select-wrapper">
+                  <button className="ios-select-trigger" onClick={() => setTemplateDropdownOpen(!templateDropdownOpen)}>
+                    <span>{templates.find((tpl) => tpl.id === createTemplate)?.label || '—'}</span>
+                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className={templateDropdownOpen ? 'rotate' : ''}>
+                      <path d="M3 5L6 8L9 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                    </svg>
+                  </button>
+                  {templateDropdownOpen && (
+                    <div className="ios-dropdown dropdown-down">
+                      {templates.map((tpl) => (
+                        <div key={tpl.id} className={`ios-dropdown-item ${createTemplate === tpl.id ? 'active' : ''}`} onClick={() => { setCreateTemplate(tpl.id); setTemplateDropdownOpen(false); }}>
+                          {tpl.label}
+                          {createTemplate === tpl.id && (
+                            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8L6.5 11.5L13 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
             <div className="modal-actions">
@@ -377,6 +717,75 @@ export default function ProjectPage() {
               <button className="btn" onClick={handleImportArxiv} disabled={importing || !arxivInput.trim()}>
                 {t('导入 arXiv')}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Template Gallery Modal ── */}
+      {templateGalleryOpen && (
+        <div className="modal-backdrop" onClick={() => setTemplateGalleryOpen(false)}>
+          <div className="modal template-gallery-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <div className="template-gallery-header-left">
+                <button className="btn ghost" onClick={() => setTemplateGalleryOpen(false)}>{t('返回')}</button>
+                <span>{t('模板库')}</span>
+              </div>
+              <button className="icon-btn" onClick={() => setTemplateGalleryOpen(false)}>✕</button>
+            </div>
+            <div className="modal-body">
+              <div className="template-gallery-subtitle">{t('选择模板快速开始您的项目')}</div>
+
+              <div className="template-gallery-categories">
+                {[{ id: 'all', label: t('全部'), labelEn: 'All' }, ...(categories || [])].map((cat) => (
+                  <button
+                    key={cat.id}
+                    className={`template-cat-tab${galleryCat === cat.id ? ' active' : ''}`}
+                    onClick={() => setGalleryCat(cat.id)}
+                  >
+                    {i18n.language === 'en-US' ? cat.labelEn : cat.label}
+                  </button>
+                ))}
+              </div>
+
+              <div className="template-gallery-filters">
+                <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 13 }}>
+                  <input type="checkbox" checked={galleryFeatured} onChange={(e) => setGalleryFeatured(e.target.checked)} />
+                  {t('精选模板')}
+                </label>
+                <input
+                  className="project-search"
+                  value={gallerySearch}
+                  onChange={(e) => setGallerySearch(e.target.value)}
+                  placeholder={t('搜索模板...')}
+                  style={{ maxWidth: 240 }}
+                />
+              </div>
+
+              <div className="template-gallery-grid">
+                {galleryTemplates.map((tpl) => (
+                  <div key={tpl.id} className="template-card" onClick={() => handleCreateFromTemplate(tpl.id)}>
+                    <div className="template-card-thumb">
+                      {tpl.featured && <span className="template-card-badge">Featured</span>}
+                    </div>
+                    <div className="template-card-body">
+                      <div className="template-card-title">{tpl.label}</div>
+                      <div className="template-card-desc">
+                        {i18n.language === 'en-US' ? (tpl.descriptionEn || tpl.description) : tpl.description}
+                      </div>
+                      {tpl.tags?.length > 0 && (
+                        <div className="template-card-tags">
+                          {tpl.tags.map((tag) => <span key={tag} className="project-tag-pill">{tag}</span>)}
+                        </div>
+                      )}
+                      {tpl.author && <div className="template-card-author">{tpl.author}</div>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {galleryTemplates.length === 0 && (
+                <div className="template-gallery-empty">{t('暂无匹配模板')}</div>
+              )}
             </div>
           </div>
         </div>

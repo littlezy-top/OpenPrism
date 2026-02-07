@@ -4,7 +4,7 @@
 
 # OpenPrism
 
-### Local-first AI-powered LaTeX writing workspace
+### OpenPrism — Vibe Writing for Academia
 
 [![Node.js Version](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -30,6 +30,19 @@
 | WebSearch / PaperSearch | Chart from tables | Formula/Chart recognition |
 
 ---
+
+<a href="#-quick-start" target="_self">
+  <img alt="Quickstart" src="https://img.shields.io/badge/🚀-Quick_Start-2F80ED?style=for-the-badge" />
+</a>
+<a href="#-core-features" target="_self">
+  <img alt="Features" src="https://img.shields.io/badge/✨-Features-orange?style=for-the-badge" />
+</a>
+<a href="#-contributing" target="_self">
+  <img alt="Contributing" src="https://img.shields.io/badge/🤝-Contributing-purple?style=for-the-badge" />
+</a>
+<a href="#wechat-group" target="_self">
+  <img alt="WeChat" src="https://img.shields.io/badge/💬-WeChat_Group-07C160?style=for-the-badge" />
+</a>
 
 </div>
 
@@ -242,3 +255,25 @@ PRs welcome. Please include a brief summary and screenshots for UI changes.
 ## 📄 License
 
 MIT
+
+---
+
+<div align="center">
+
+**If this project helps you, please give us a ⭐️ Star!**
+
+[![GitHub stars](https://img.shields.io/github/stars/yourusername/OpenPrism?style=social)](https://github.com/yourusername/OpenPrism/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/yourusername/OpenPrism?style=social)](https://github.com/yourusername/OpenPrism/network/members)
+
+<br>
+
+<a name="wechat-group"></a>
+<img src="static/wechat.png" alt="OpenPrism WeChat Community" width="300"/>
+<br>
+<sub>Scan to join the community WeChat group</sub>
+
+<p align="center">
+  <em>Made with ❤️ by OpenPrism Team</em>
+</p>
+
+</div>

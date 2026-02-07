@@ -4,7 +4,7 @@
 
 # OpenPrism
 
-### 本地部署的 AI 驱动 LaTeX 学术写作工作台
+### OpenPrism - 氛围写作平台
 
 [![Node.js Version](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -34,6 +34,9 @@
 [![快速开始](https://img.shields.io/badge/📖-快速开始-blue?style=for-the-badge)](#-快速开始)
 [![功能概览](https://img.shields.io/badge/✨-功能概览-orange?style=for-the-badge)](#-核心功能)
 [![贡献指南](https://img.shields.io/badge/🤝-贡献指南-purple?style=for-the-badge)](#-贡献指南)
+<a href="#wechat-group" target="_self">
+  <img alt="WeChat" src="https://img.shields.io/badge/💬-微信群-07C160?style=for-the-badge" />
+</a>
 
 </div>
 
@@ -333,8 +336,20 @@ MIT License. See [LICENSE](LICENSE).
 
 <div align="center">
 
-### ⭐ 如果这个项目对你有帮助，请给我们一个 Star！
+**如果这个项目对你有帮助，请给我们一个 ⭐️ Star！**
 
-[![Star History Chart](https://api.star-history.com/svg?repos=yourusername/OpenPrism&type=Date)](https://star-history.com/#yourusername/OpenPrism&Date)
+[![GitHub stars](https://img.shields.io/github/stars/yourusername/OpenPrism?style=social)](https://github.com/yourusername/OpenPrism/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/yourusername/OpenPrism?style=social)](https://github.com/yourusername/OpenPrism/network/members)
+
+<br>
+
+<a name="wechat-group"></a>
+<img src="static/wechat.png" alt="OpenPrism 微信交流群" width="300"/>
+<br>
+<sub>扫码加入微信交流群</sub>
+
+<p align="center">
+  <em>Made with ❤️ by OpenPrism Team</em>
+</p>
 
 </div>

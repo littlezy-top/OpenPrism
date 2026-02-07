@@ -4,7 +4,7 @@ export function registerHealthRoutes(fastify) {
   fastify.get('/api/health', async () => ({ ok: true }));
 
   fastify.get('/api/templates', async () => {
-    const templates = await readTemplateManifest();
-    return { templates };
+    const { templates, categories } = await readTemplateManifest();
+    return { templates, categories };
   });
 }

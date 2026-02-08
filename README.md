@@ -13,7 +13,7 @@
 [![GitHub Issues](https://img.shields.io/github/issues/OpenDCAI/OpenPrism)](https://github.com/OpenDCAI/OpenPrism/issues)
 [![GitHub Pull Requests](https://img.shields.io/github/issues-pr/OpenDCAI/OpenPrism)](https://github.com/OpenDCAI/OpenPrism/pulls)
 
-[中文](README.md) | [English](README_EN.md)
+[中文](README_ZH.md) | [English](README.md)
 
 ---
 
@@ -107,6 +107,14 @@ OpenPrism is a local-first LaTeX + AI workspace for academic writing, optimized 
 - **Table-to-chart**: generate charts directly from tables
 - **Smart recognition**: formulas and charts auto-detected
 
+### 📝 Peer Review
+
+- **AI Quality Check**: automated paper quality assessment
+- **Full Review Report**: generate detailed reviewer-style review comments
+- **Consistency Check**: terminology and symbol consistency detection
+- **Missing Citations**: find statements that need citations
+- **Compile Log Summary**: summarize compile errors and fix suggestions
+
 ---
 
 ## 🎨 Showcase
@@ -135,7 +143,7 @@ OpenPrism is a local-first LaTeX + AI workspace for academic writing, optimized 
 
 <div align="center">
 <br>
-<img src="static/Agent模式.gif" alt="Agent mode" width="85%"/>
+<img src="static/Agent模式.png" alt="Agent mode" width="85%"/>
 <br>
 <sub>✨ Generate diff suggestions for review</sub>
 <br><br>
@@ -145,7 +153,7 @@ OpenPrism is a local-first LaTeX + AI workspace for academic writing, optimized 
 
 <div align="center">
 <br>
-<img src="static/一键诊断.gif" alt="One-click diagnose" width="85%"/>
+<img src="static/一键诊断.png" alt="One-click diagnose" width="85%"/>
 <br>
 <sub>✨ Parse compile errors and jump to locations</sub>
 <br><br>
@@ -199,13 +207,13 @@ OpenPrism is a local-first LaTeX + AI workspace for academic writing, optimized 
 <br><br>
 </div>
 
-### 🧾 Diff Preview
+### 📝 Peer Review
 
 <div align="center">
 <br>
-<img src="static/Diff预览.gif" alt="Diff preview" width="85%"/>
+<img src="static/同行评审.png" alt="Peer Review" width="85%"/>
 <br>
-<sub>✨ Side-by-side diff with full-screen view</sub>
+<sub>✨ AI Quality Check: Review Report / Consistency Check / Missing Citations / Compile Summary</sub>
 <br><br>
 </div>
 
@@ -437,6 +445,7 @@ OpenPrism/
 
 ## 🗺️ Roadmap
 
+- Fix some bugs
 - Collaborative editing and comments
 - Version snapshots and rollback
 - Citation search assistant (auto-generate BibTeX)

@@ -13,7 +13,7 @@
 [![GitHub Issues](https://img.shields.io/github/issues/OpenDCAI/OpenPrism)](https://github.com/OpenDCAI/OpenPrism/issues)
 [![GitHub Pull Requests](https://img.shields.io/github/issues-pr/OpenDCAI/OpenPrism)](https://github.com/OpenDCAI/OpenPrism/pulls)
 
-[中文](README.md) | [English](README_EN.md)
+[中文](README_ZH.md) | [English](README.md)
 
 ---
 
@@ -101,6 +101,14 @@ OpenPrism 是一个面向学术写作的本地部署 LaTeX + AI 工作台，强�
 - **表格绘图**：根据表格直接生成图表
 - **智能识别**：公式与图表结构自动识别
 
+### 📝 同行评审
+
+- **AI 质量检查**：论文质量自动评估
+- **完整审稿报告**：生成详细的 Reviewer 风格审稿意见
+- **一致性检查**：术语与符号一致性检测
+- **缺失引用检测**：查找需要补充引用的陈述
+- **编译日志摘要**：汇总编译错误与修复建议
+
 ---
 
 ## 🎨 功能展示
@@ -130,7 +138,7 @@ OpenPrism 是一个面向学术写作的本地部署 LaTeX + AI 工作台，强�
 
 <div align="center">
 <br>
-<img src="static/Agent模式.gif" alt="Agent 模式" width="85%"/>
+<img src="static/Agent模式.png" alt="Agent 模式" width="85%"/>
 <br>
 <sub>✨ Agent 模式：生成可编辑建议 + Diff 预览</sub>
 <br><br>
@@ -140,7 +148,7 @@ OpenPrism 是一个面向学术写作的本地部署 LaTeX + AI 工作台，强�
 
 <div align="center">
 <br>
-<img src="static/一键诊断.gif" alt="一键诊断" width="85%"/>
+<img src="static/一键诊断.png" alt="一键诊断" width="85%"/>
 <br>
 <sub>✨ 编译错误自动解析 + 定位</sub>
 <br><br>
@@ -160,7 +168,7 @@ OpenPrism 是一个面向学术写作的本地部署 LaTeX + AI 工作台，强�
 
 <div align="center">
 <br>
-<img src="static/论文检索.gif" alt="论文检索" width="85%"/>
+<img src="static/论文检索.gif" alt="论文检索" width="80%"/>
 <br>
 <sub>✨ 论文检索与引用信息获取</sub>
 <br><br>
@@ -194,25 +202,15 @@ OpenPrism 是一个面向学术写作的本地部署 LaTeX + AI 工作台，强�
 <br><br>
 </div>
 
-### 🧾 Diff 预览
+### 📝 同行评审
 
 <div align="center">
 <br>
-<img src="static/Diff预览.gif" alt="Diff 预览" width="85%"/>
+<img src="static/同行评审.png" alt="同行评审" width="85%"/>
 <br>
-<sub>✨ 分栏 Diff + 全屏放大查看</sub>
+<sub>✨ AI 质量检查：审稿报告 / 一致性检查 / 缺失引用 / 编译摘要</sub>
 <br><br>
 </div>
-
-<!-- ### 📚 模板切换
-
-<div align="center">
-<br>
-<img src="static/screenshots/templates/template-switch.gif" alt="模板切换" width="85%"/>
-<br>
-<sub>✨ 一键切换 ACL / CVPR / NeurIPS / ICML</sub>
-<br><br>
-</div> -->
 
 ---
 

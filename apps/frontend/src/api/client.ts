@@ -432,3 +432,52 @@ export async function visionToLatex(payload: {
   }
   return res.json() as Promise<{ ok: boolean; latex?: string; assetPath?: string; error?: string }>;
 }
+
+// ─── Transfer Agent API ───
+
+export interface TransferStartPayload {
+  sourceProjectId: string;
+  sourceMainFile: string;
+  targetProjectId: string;
+  targetMainFile: string;
+  engine?: string;
+  layoutCheck?: boolean;
+  llmConfig?: Partial<LLMConfig>;
+}
+
+export interface TransferStepResult {
+  status: string;
+  progressLog: string[];
+  error?: string;
+}
+
+export interface PageImage {
+  page: number;
+  base64: string;
+  mime: string;
+}
+
+export function transferStart(payload: TransferStartPayload) {
+  return request<{ jobId: string }>('/api/transfer/start', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export function transferStep(jobId: string) {
+  return request<TransferStepResult>('/api/transfer/step', {
+    method: 'POST',
+    body: JSON.stringify({ jobId }),
+  });
+}
+
+export function transferSubmitImages(jobId: string, images: PageImage[]) {
+  return request<{ ok: boolean }>('/api/transfer/submit-images', {
+    method: 'POST',
+    body: JSON.stringify({ jobId, images }),
+  });
+}
+
+export function transferStatus(jobId: string) {
+  return request<TransferStepResult>(`/api/transfer/status/${jobId}`);
+}

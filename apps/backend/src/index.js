@@ -13,6 +13,7 @@ import { registerVisionRoutes } from './routes/vision.js';
 import { registerPlotRoutes } from './routes/plot.js';
 import { registerAgentRoutes } from './routes/agent.js';
 import { registerCollabRoutes } from './routes/collab.js';
+import { registerTransferRoutes } from './routes/transfer.js';
 import { tryStartTunnel } from './services/tunnel.js';
 import { requireAuthIfRemote } from './utils/authUtils.js';
 import { fileURLToPath } from 'node:url';
@@ -51,6 +52,7 @@ registerVisionRoutes(fastify);
 registerPlotRoutes(fastify);
 registerAgentRoutes(fastify);
 registerCollabRoutes(fastify);
+registerTransferRoutes(fastify);
 
 // Serve frontend static files in tunnel/production mode
 const __filename = fileURLToPath(import.meta.url);

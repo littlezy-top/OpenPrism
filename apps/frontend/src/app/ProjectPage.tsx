@@ -16,6 +16,7 @@ import {
   permanentDeleteProject
 } from '../api/client';
 import type { ProjectMeta, TemplateMeta, TemplateCategory } from '../api/client';
+import TransferPanel from './TransferPanel';
 
 type ViewFilter = 'all' | 'mine' | 'archived' | 'trash';
 type SortBy = 'updatedAt' | 'name' | 'createdAt';
@@ -67,6 +68,10 @@ export default function ProjectPage() {
   const [newSidebarTag, setNewSidebarTag] = useState('');
   const [addingSidebarTag, setAddingSidebarTag] = useState(false);
   const [sortDropdownOpen, setSortDropdownOpen] = useState(false);
+
+  // Transfer modal state
+  const [transferOpen, setTransferOpen] = useState(false);
+  const [transferSource, setTransferSource] = useState<{ id: string; name: string } | null>(null);
 
   const loadProjects = useCallback(async () => {
     const res = await listProjects();
@@ -560,6 +565,7 @@ export default function ProjectPage() {
                         <button className="btn ghost" onClick={() => navigate(`/editor/${project.id}`)}>{t('打开')}</button>
                         <button className="btn ghost" onClick={() => setRenameState({ id: project.id, value: project.name })}>{t('重命名')}</button>
                         <button className="btn ghost" onClick={() => handleCopy(project.id, project.name)}>{t('复制')}</button>
+                        <button className="btn ghost" onClick={() => { setTransferSource({ id: project.id, name: project.name }); setTransferOpen(true); }}>{t('转换')}</button>
                         {project.archived
                           ? <button className="btn ghost" onClick={() => handleArchive(project.id, false)}>{t('取消归档')}</button>
                           : <button className="btn ghost" onClick={() => handleArchive(project.id, true)}>{t('归档')}</button>
@@ -786,6 +792,24 @@ export default function ProjectPage() {
               {galleryTemplates.length === 0 && (
                 <div className="template-gallery-empty">{t('暂无匹配模板')}</div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Transfer Modal */}
+      {transferOpen && transferSource && (
+        <div className="modal-backdrop" onClick={() => setTransferOpen(false)}>
+          <div className="modal" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header">
+              <div>{t('模板转换')} — {transferSource.name}</div>
+              <button className="icon-btn" onClick={() => setTransferOpen(false)}>✕</button>
+            </div>
+            <div className="modal-body">
+              <TransferPanel
+                projectId={transferSource.id}
+                mainFile="main.tex"
+              />
             </div>
           </div>
         </div>

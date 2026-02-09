@@ -468,7 +468,8 @@ OPENPRISM_COLLAB_TOKEN_TTL=86400
 4. **Join**: Collaborator opens the link, token is verified automatically, and they enter the editor
 5. **Edit together**: Multiple cursors visible in real time, edits sync automatically, conflicts resolved by CRDT
 
-### Nginx Reverse Proxy (Recommended)
+<details>
+<summary><strong>Nginx Reverse Proxy (Recommended, For Public Servers)</strong></summary>
 
 Collaboration requires WebSocket. Nginx must be configured with upgrade headers:
 
@@ -488,6 +489,48 @@ server {
 ```
 
 > **Tip**: Local access (127.0.0.1) bypasses token verification by default, suitable for local development.
+
+</details>
+
+<details>
+<summary><strong>No Public Server? Use Tunnel (ngrok)</strong></summary>
+
+You can collaborate remotely without a public server. OpenPrism has built-in tunnel support — one command exposes your local service to the internet.
+
+#### Quick Start (ngrok, Recommended)
+
+1. Sign up for a free [ngrok](https://dashboard.ngrok.com/get-started/your-authtoken) account and get your authtoken
+2. Run the following commands:
+
+```bash
+export NGROK_AUTHTOKEN=your_token_here
+
+npm run tunnel:ngrok
+
+```
+
+3. On startup, the terminal prints a public URL. Share it with your collaborator:
+
+```
+  OpenPrism started at http://localhost:8787
+
+  Tunnel active (ngrok):
+  Public URL: https://xxxx.ngrok-free.app
+  Share this URL to collaborate remotely!
+```
+
+4. Your collaborator opens the URL in their browser and starts editing in real-time
+
+#### Other Tunnel Options
+
+| Option | Command | Notes |
+|--------|---------|-------|
+| localtunnel | `npm run tunnel` | Zero-config, but may be unstable |
+| Cloudflare Tunnel | `npm run tunnel:cf` | Requires [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation/) installed |
+
+> **Note**: Tunnel is off by default. Regular `npm start` does not create a tunnel. You can also set it via env var: `OPENPRISM_TUNNEL=ngrok npm start`
+
+</details>
 
 ---
 

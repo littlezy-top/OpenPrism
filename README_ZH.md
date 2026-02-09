@@ -536,7 +536,8 @@ OPENPRISM_COLLAB_TOKEN_TTL=86400
 4. **加入协作**：协作者打开链接，令牌自动验证后进入编辑器
 5. **实时编辑**：多人光标实时可见，编辑内容自动同步，冲突自动解决
 
-### Nginx 反向代理配置（推荐）
+<details>
+<summary><strong>Nginx 反向代理配置（推荐，适合有公网服务器）</strong></summary>
 
 协作依赖 WebSocket，Nginx 需要配置升级头：
 
@@ -556,6 +557,47 @@ server {
 ```
 
 > **提示**：本地访问（127.0.0.1）默认免令牌验证，适合本地开发调试。
+
+</details>
+
+<details>
+<summary><strong>无公网服务器？使用内网穿透（ngrok）</strong></summary>
+
+没有公网服务器也可以远程协作，OpenPrism 内置了隧道支持，一条命令即可将本地服务暴露到公网。
+
+#### 快速开始（ngrok，推荐）
+
+1. 注册 [ngrok](https://dashboard.ngrok.com/get-started/your-authtoken) 免费账号，获取 authtoken
+2. 运行以下命令：
+
+```bash
+export NGROK_AUTHTOKEN=your_token_here
+
+npm run tunnel:ngrok
+```
+
+3. 启动后终端会输出公网 URL，将该 URL 发给协作者即可：
+
+```
+  OpenPrism started at http://localhost:8787
+
+  Tunnel active (ngrok):
+  Public URL: https://xxxx.ngrok-free.app
+  Share this URL to collaborate remotely!
+```
+
+4. 协作者在浏览器打开该 URL，即可实时协作编辑
+
+#### 其他隧道方案
+
+| 方案 | 命令 | 说明 |
+|------|------|------|
+| localtunnel | `npm run tunnel` | 零配置，但可能不稳定 |
+| Cloudflare Tunnel | `npm run tunnel:cf` | 需安装 [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation/) |
+
+> **注意**：隧道默认关闭，普通 `npm start` 不会创建隧道。也可通过环境变量手动指定：`OPENPRISM_TUNNEL=ngrok npm start`
+
+</details>
 
 ---
 

@@ -15,3 +15,4 @@ export const COLLAB_REQUIRE_TOKEN = requireTokenEnv
   ? !['0', 'false', 'no'].includes(String(requireTokenEnv).toLowerCase())
   : true;
 export const COLLAB_FLUSH_DEBOUNCE_MS = Number(process.env.OPENPRISM_COLLAB_FLUSH_DEBOUNCE_MS || 800);
+export const TUNNEL_MODE = process.env.OPENPRISM_TUNNEL || 'false';

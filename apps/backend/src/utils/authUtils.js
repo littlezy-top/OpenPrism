@@ -1,5 +1,5 @@
 import { verifyToken } from '../services/collab/tokenService.js';
-import { COLLAB_REQUIRE_TOKEN } from '../config/constants.js';
+import { COLLAB_REQUIRE_TOKEN, TUNNEL_MODE } from '../config/constants.js';
 
 export function isLocalAddress(ip) {
   if (!ip) return false;
@@ -9,9 +9,13 @@ export function isLocalAddress(ip) {
 }
 
 export function getClientIp(req) {
-  const forwarded = req.headers?.['x-forwarded-for'];
-  if (forwarded) {
-    return String(forwarded).split(',')[0].trim();
+  // In tunnel mode, ignore x-forwarded-for since the tunnel proxy is local
+  const tunnelActive = !['false', '0', 'no'].includes(TUNNEL_MODE.toLowerCase().trim());
+  if (!tunnelActive) {
+    const forwarded = req.headers?.['x-forwarded-for'];
+    if (forwarded) {
+      return String(forwarded).split(',')[0].trim();
+    }
   }
   return req.ip;
 }

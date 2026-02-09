@@ -16,7 +16,6 @@
   "Chart title": "Chart title",
   "Chat": "Chat",
   "Chat 模式仅对话，不会改动文件。": "Chat mode is read-only and won't modify files.",
-  "Check terminology, notation, and consistency across the project. Return concise findings.": "Check terminology, notation, and consistency across the project. Return concise findings.",
   "Cite": "Cite",
   "Compile": "Compile",
   "Compile Log": "Compile Log",
@@ -475,5 +474,16 @@
   "协作暂不支持该文件类型。": "Collaboration doesn't support this file type yet.",
   "已连接": "Connected",
   "连接中...": "Connecting...",
-  "未连接": "Disconnected"
+  "未连接": "Disconnected",
+  "模板转换": "Template Transfer",
+  "目标项目": "Target Project",
+  "目标主文件": "Target Main File",
+  "编译引擎": "Compile Engine",
+  "选择目标项目...": "Select target project...",
+  "暂无可选项目": "No projects available",
+  "启用排版检查 (VLM)": "Enable layout check (VLM)",
+  "开始转换": "Start Transfer",
+  "转换中...": "Transferring...",
+  "转换": "Transfer",
+  "状态": "Status"
 }

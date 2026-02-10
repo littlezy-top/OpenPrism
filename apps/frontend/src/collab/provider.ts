@@ -128,6 +128,10 @@ export class CollabProvider {
     ws.onopen = () => {
       this.reconnectAttempts = 0;
       this.onStatus?.('connected');
+      const syncEncoder = encoding.createEncoder();
+      encoding.writeVarUint(syncEncoder, MESSAGE_SYNC);
+      syncProtocol.writeSyncStep1(syncEncoder, this.doc);
+      ws.send(encoding.toUint8Array(syncEncoder));
       const localState = this.awareness.getLocalState();
       if (localState) {
         this.awareness.setLocalState(localState);

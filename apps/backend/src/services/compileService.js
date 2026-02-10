@@ -25,12 +25,12 @@ function buildCommand(engine, outDir, mainFile) {
 
 export { SUPPORTED_ENGINES };
 
-// Engines that need two passes for cross-references, lineno switch mode, etc.
-const DOUBLE_PASS_ENGINES = ['pdflatex', 'xelatex', 'lualatex'];
+// Engines that need multiple passes + bibtex for citations
+const MULTI_PASS_ENGINES = ['pdflatex', 'xelatex', 'lualatex'];
 
-function runSpawn(cmd, args, cwd, pushLog) {
+function runSpawn(cmd, args, cwd, pushLog, env) {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { cwd });
+    const child = spawn(cmd, args, { cwd, env: env || process.env });
     child.stdout.on('data', pushLog);
     child.stderr.on('data', pushLog);
     child.on('error', (err) => reject(err));
@@ -65,11 +65,54 @@ export async function runCompile({ projectId, mainFile, engine = 'pdflatex' }) {
   };
 
   const { cmd, args } = buildCommand(engine, outDir, mainFile);
-  const passes = DOUBLE_PASS_ENGINES.includes(engine) ? 2 : 1;
+  const needsBibPass = MULTI_PASS_ENGINES.includes(engine);
 
   let code;
   try {
-    for (let i = 0; i < passes; i++) {
+    // Pass 1: generate .aux with \citation{} entries
+    code = await runSpawn(cmd, args, projectRoot, pushLog);
+
+    if (needsBibPass) {
+      const base = path.basename(mainFile, path.extname(mainFile));
+      const auxPath = path.join(outDir, `${base}.aux`);
+
+      // Detect whether to use biber or bibtex by checking .aux / source for biblatex
+      let useBiber = false;
+      try {
+        const auxContent = await fs.readFile(auxPath, 'utf8');
+        // biblatex writes \abx@aux@... commands in .aux; traditional bibtex does not
+        useBiber = auxContent.includes('\\abx@aux@');
+      } catch { /* .aux missing — skip bib pass */ }
+
+      // Also check the source .tex for \usepackage{biblatex} as a fallback
+      if (!useBiber) {
+        try {
+          const texContent = await fs.readFile(safeJoin(projectRoot, mainFile), 'utf8');
+          useBiber = /\\usepackage(\[.*?\])?\{biblatex\}/.test(texContent);
+        } catch { /* ignore */ }
+      }
+
+      const bibCmd = useBiber ? 'biber' : 'bibtex';
+      const bibEnv = {
+        ...process.env,
+        BIBINPUTS: `${projectRoot}:`,
+        BSTINPUTS: `${projectRoot}:`,
+      };
+      // Run bibtex/biber with cwd=outDir and relative base name to avoid
+      // openout_any=p blocking writes to absolute paths.
+      const bibArgs = useBiber
+        ? [`--input-directory=${projectRoot}`, base]
+        : [base];
+
+      try {
+        await runSpawn(bibCmd, bibArgs, outDir, pushLog, bibEnv);
+      } catch {
+        // bibtex/biber not installed or failed — continue without it
+        pushLog(Buffer.from(`[warn] ${bibCmd} not available, skipping bibliography pass.\n`));
+      }
+
+      // Pass 2 + 3: resolve citations and cross-references
+      code = await runSpawn(cmd, args, projectRoot, pushLog);
       code = await runSpawn(cmd, args, projectRoot, pushLog);
     }
   } catch (err) {

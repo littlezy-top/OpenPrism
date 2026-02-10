@@ -1,13 +1,7 @@
 import { ChatOpenAI } from '@langchain/openai';
 import { HumanMessage } from '@langchain/core/messages';
 import { resolveLLMConfig, normalizeBaseURL } from '../../llmService.js';
-
-/**
- * Strip markdown code fences from LLM output.
- */
-function stripCodeFences(text) {
-  return text.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
-}
+import { extractJSON, validateSchema } from '../utils.js';
 
 /**
  * checkLayout node — sends page screenshots to VLM
@@ -45,13 +39,59 @@ export async function checkLayout(state) {
   }
 
   const message = new HumanMessage({ content: contentParts });
-  const response = await llm.invoke([message]);
 
-  let result;
-  try {
-    result = JSON.parse(stripCodeFences(response.content));
-  } catch {
-    result = { ok: true, issues: [], raw: response.content };
+  // Schema for layout check result
+  const layoutSchema = {
+    summary: { type: 'string', required: false },
+    issues:  { type: 'array', required: true },
+  };
+
+  const MAX_RETRIES = 2;
+  let result = null;
+  let retries = 0;
+  let messages = [message];
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const response = await llm.invoke(messages);
+    const raw = typeof response.content === 'string' ? response.content : '';
+
+    const parsed = extractJSON(raw);
+    if (parsed === null) {
+      if (attempt < MAX_RETRIES) {
+        messages = [
+          message,
+          { role: 'assistant', content: raw },
+          { role: 'user', content:
+            'Your previous response could not be parsed as valid JSON. '
+            + 'Please output ONLY a valid JSON object with no extra text.' },
+        ];
+        retries++;
+        continue;
+      }
+      // All retries exhausted — treat as parse failure, NOT as ok
+      result = { ok: false, issues: [], parseError: true, raw };
+      break;
+    }
+
+    const { valid, errors } = validateSchema(parsed, layoutSchema);
+    if (!valid && attempt < MAX_RETRIES) {
+      messages = [
+        message,
+        { role: 'assistant', content: raw },
+        { role: 'user', content:
+          `The JSON was parsed but has schema issues: ${errors.join('; ')}. `
+          + 'Please fix and output ONLY the corrected JSON object.' },
+      ];
+      retries++;
+      continue;
+    }
+
+    result = parsed;
+    break;
+  }
+
+  if (!result) {
+    result = { ok: false, issues: [], parseError: true };
   }
 
   const hasIssues = (result.issues || []).some(i => i.severity === 'high');
@@ -59,7 +99,7 @@ export async function checkLayout(state) {
   return {
     layoutCheckResult: { ok: !hasIssues, ...result },
     layoutAttempt: (state.layoutAttempt || 0) + 1,
-    progressLog: `[checkLayout] Found ${(result.issues || []).length} issues, ${hasIssues ? 'needs fix' : 'acceptable'}.`,
+    progressLog: `[checkLayout] Found ${(result.issues || []).length} issues, ${hasIssues ? 'needs fix' : 'acceptable'}${retries > 0 ? ` (after ${retries} retries)` : ''}${result.parseError ? ' [JSON parse failed]' : ''}.`,
   };
 }
 

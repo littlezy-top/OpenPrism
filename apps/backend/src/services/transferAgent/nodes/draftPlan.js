@@ -1,12 +1,6 @@
 import { ChatOpenAI } from '@langchain/openai';
 import { resolveLLMConfig, normalizeBaseURL } from '../../llmService.js';
-
-/**
- * Strip markdown code fences from LLM output.
- */
-function stripCodeFences(text) {
-  return text.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
-}
+import { invokeLLMForJSON } from '../utils.js';
 
 /**
  * draftPlan node — LLM generates a structured transfer plan
@@ -59,18 +53,23 @@ Rules:
 - Keep the target preamble unchanged
 - Output ONLY valid JSON, no markdown fences`;
 
-  const response = await llm.invoke([{ role: 'user', content: prompt }]);
-  const raw = response.content;
+  const planSchema = {
+    sectionMapping: { type: 'array', required: true },
+    assetStrategy:  { type: 'object', required: true },
+    notes:          { type: 'string', required: false },
+  };
 
-  let plan;
-  try {
-    plan = JSON.parse(stripCodeFences(raw));
-  } catch {
-    plan = { raw, parseError: true, sectionMapping: [], assetStrategy: {}, notes: '' };
-  }
+  const { parsed, raw, retries } = await invokeLLMForJSON(
+    llm,
+    [{ role: 'user', content: prompt }],
+    { schema: planSchema, maxRetries: 2, nodeName: 'draftPlan' },
+  );
+
+  const plan = parsed || { raw, parseError: true, sectionMapping: [], assetStrategy: {}, notes: '' };
+  const retryNote = retries > 0 ? ` (after ${retries} retries)` : '';
 
   return {
     transferPlan: plan,
-    progressLog: `[draftPlan] Generated migration plan with ${plan.sectionMapping?.length || 0} section mappings.`,
+    progressLog: `[draftPlan] Generated migration plan with ${plan.sectionMapping?.length || 0} section mappings${retryNote}.`,
   };
 }

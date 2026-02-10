@@ -23,6 +23,10 @@
 |:---:|:---:|:---:|
 | Chat / Agent history<br>Tools multi-step edits | TexLive / Tectonic / Auto<br>PDF preview & download | ACL / CVPR / NeurIPS / ICML<br>One-click conversion |
 
+| 🔄 Template Transfer | | |
+|:---:|:---:|:---:|
+| Legacy (LaTeX→LaTeX) / MinerU (PDF→MD→LaTeX)<br>LLM-powered migration + auto compile fix + VLM layout check | | |
+
 | 🔧 Advanced Editing | 🗂️ Project Management | ⚙️ Configuration |
 |:---:|:---:|:---:|
 | AI autocomplete / Diff / diagnose | Multi-project + file tree + upload | OpenAI-compatible endpoint<br>Local-first privacy |
@@ -57,6 +61,10 @@
 > [!WARNING]
 > 🚧 <strong>Template Transfer is under testing</strong><br>
 > The Template Transfer feature is currently in beta and may contain known or unknown bugs. If you encounter any issues, please report them via [Issues](https://github.com/OpenDCAI/OpenPrism/issues).
+
+> [!TIP]
+> 🆕 <strong>2025-02 · Template Transfer (Dual Mode)</strong><br>
+> Two transfer modes are now available: Legacy mode (LaTeX→LaTeX direct migration) and MinerU mode (PDF→Markdown→LaTeX via MinerU API). Both modes feature LLM-powered content migration, automatic compile error fixing, and optional VLM-based layout checking.
 
 > [!TIP]
 > 🆕 <strong>2025-02 · Real-time Collaboration</strong><br>
@@ -97,6 +105,15 @@ OpenPrism is a local-first LaTeX + AI workspace for academic writing, optimized 
 
 - **Built-ins**: ACL / CVPR / NeurIPS / ICML
 - **Conversion**: one-click template switch with content preserved
+
+### 🔄 Template Transfer
+
+- **Dual mode**: Legacy (LaTeX→LaTeX) and MinerU (PDF→Markdown→LaTeX)
+- **MinerU integration**: parse PDF via MinerU API, extract Markdown + images, then fill into target template
+- **LLM-powered migration**: AI analyzes source/target structure, drafts transfer plan, and applies content mapping
+- **Auto compile fix**: automatically detect and fix LaTeX compilation errors with retry loop
+- **VLM layout check**: optional visual layout validation using VLM to detect overflow, overlap, and spacing issues
+- **Asset handling**: automatic copy of images, bib files, and style files from source to target
 
 ### 🗂️ Project Management
 
@@ -377,6 +394,10 @@ OPENPRISM_DATA_DIR=./data
 
 # Backend service port
 PORT=8787
+
+# MinerU API Configuration (for PDF→MD→LaTeX transfer)
+OPENPRISM_MINERU_API_BASE=https://mineru.net/api/v4
+OPENPRISM_MINERU_TOKEN=your-mineru-token
 ```
 
 ### LLM Configuration
@@ -556,10 +577,20 @@ OpenPrism/
 │   ├── frontend/           # React + Vite frontend
 │   │   ├── src/
 │   │   │   ├── app/App.tsx    # Main application logic
+│   │   │   ├── app/TransferPanel.tsx  # Template transfer UI
 │   │   │   ├── api/client.ts  # API calls
 │   │   │   └── latex/         # TexLive integration
 │   └── backend/            # Fastify backend
-│       └── src/index.js       # API / compile / LLM proxy
+│       └── src/
+│           ├── index.js       # API / compile / LLM proxy
+│           ├── routes/transfer.js  # Transfer API endpoints
+│           └── services/
+│               ├── mineruService.js        # MinerU API integration
+│               └── transferAgent/          # LangGraph transfer workflows
+│                   ├── graph.js            # Legacy transfer graph
+│                   ├── graphMineru.js       # MinerU transfer graph
+│                   ├── state.js            # Transfer state schema
+│                   └── nodes/              # Workflow nodes
 ├── templates/              # LaTeX templates (ACL/CVPR/NeurIPS/ICML)
 ├── data/                   # Project storage directory (default)
 └── README.md
@@ -591,9 +622,9 @@ OpenPrism/
 <td>Integrate third-party Search APIs (e.g. Google / Baidu / SerpAPI) for improved search quality and coverage</td>
 </tr>
 <tr>
-<td><strong>📚 One-click Template Conversion</strong></td>
-<td><img src="https://img.shields.io/badge/⏳-Planned-yellow?style=flat-square" alt="Planned"/></td>
-<td>Quick conversion between conference templates (e.g. ACL → NeurIPS) while preserving content and formatting</td>
+<td><strong>📚 Template Transfer (Dual Mode)</strong></td>
+<td><img src="https://img.shields.io/badge/✅-Done-success?style=flat-square" alt="Done"/></td>
+<td>Legacy (LaTeX→LaTeX) and MinerU (PDF→MD→LaTeX) dual-mode template transfer with LLM-powered migration, auto compile fix, and VLM layout check</td>
 </tr>
 <tr>
 <td><strong>📸 Version Snapshots &amp; Rollback</strong></td>

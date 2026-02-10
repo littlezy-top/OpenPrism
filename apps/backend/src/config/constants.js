@@ -16,3 +16,8 @@ export const COLLAB_REQUIRE_TOKEN = requireTokenEnv
   : true;
 export const COLLAB_FLUSH_DEBOUNCE_MS = Number(process.env.OPENPRISM_COLLAB_FLUSH_DEBOUNCE_MS || 800);
 export const TUNNEL_MODE = process.env.OPENPRISM_TUNNEL || 'false';
+
+// MinerU API
+export const MINERU_API_BASE = 'https://mineru.net/api/v4';
+export const MINERU_POLL_INTERVAL_MS = 3000;
+export const MINERU_MAX_POLL_ATTEMPTS = 200;

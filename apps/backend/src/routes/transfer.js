@@ -1,7 +1,10 @@
 import crypto from 'crypto';
 import path from 'path';
+import { promises as fs } from 'fs';
 import { buildTransferGraph } from '../services/transferAgent/graph.js';
+import { buildMineruTransferGraph } from '../services/transferAgent/graphMineru.js';
 import { resolveLLMConfig } from '../services/llmService.js';
+import { resolveMineruConfig } from '../services/mineruService.js';
 import { readTemplateManifest } from '../services/templateService.js';
 import { DATA_DIR, TEMPLATE_DIR } from '../config/constants.js';
 import { ensureDir, readJson, writeJson, copyDir } from '../utils/fsUtils.js';
@@ -82,6 +85,7 @@ export function registerTransferRoutes(fastify) {
       state: initialState,
       status: 'pending',
       progressLog: [],
+      hasStarted: false,
       iterator: null,
     });
 
@@ -108,7 +112,10 @@ export function registerTransferRoutes(fastify) {
 
     try {
       job.status = 'running';
-      const result = await job.graph.invoke(job.state);
+      const runConfig = { configurable: { thread_id: jobId } };
+      const input = job.hasStarted ? null : job.state;
+      const result = await job.graph.invoke(input, runConfig);
+      job.hasStarted = true;
       job.state = result;
       job.progressLog = result.progressLog || [];
       job.status = result.status || 'running';
@@ -144,8 +151,19 @@ export function registerTransferRoutes(fastify) {
       return reply.code(400).send({ error: 'Job is not waiting for images.' });
     }
 
-    // Inject images into state and resume
-    job.state.pageImages = images || [];
+    // Inject images into checkpointed state so the next /step can resume from checkLayout.
+    const updated = { pageImages: images || [], status: 'running' };
+    try {
+      if (job.hasStarted && typeof job.graph.updateState === 'function') {
+        await job.graph.updateState(
+          { configurable: { thread_id: jobId } },
+          updated,
+        );
+      }
+    } catch {
+      // Fallback to in-memory state mutation if checkpoint update fails.
+    }
+    job.state = { ...job.state, ...updated };
     job.status = 'running';
 
     return { ok: true };
@@ -166,6 +184,145 @@ export function registerTransferRoutes(fastify) {
       progressLog: job.progressLog,
       error: job.error || null,
     };
+  });
+
+  /**
+   * POST /api/transfer/start-mineru
+   * Body: { sourceProjectId?, sourceMainFile?, targetTemplateId, targetMainFile,
+   *         engine?, layoutCheck?, llmConfig?, mineruConfig? }
+   * MinerU-based transfer: PDF → Markdown → LaTeX.
+   * If sourceProjectId is provided, compiles source to PDF first.
+   * If not, expects PDF to be uploaded via /api/transfer/upload-pdf.
+   * Returns: { jobId, newProjectId }
+   */
+  fastify.post('/api/transfer/start-mineru', async (request, reply) => {
+    const {
+      sourceProjectId, sourceMainFile,
+      targetTemplateId, targetMainFile,
+      engine = 'pdflatex',
+      layoutCheck = false,
+      llmConfig,
+      mineruConfig,
+    } = request.body || {};
+
+    if (!targetTemplateId || !targetMainFile) {
+      return reply.code(400).send({ error: 'Missing targetTemplateId or targetMainFile.' });
+    }
+    if (!!sourceProjectId !== !!sourceMainFile) {
+      return reply.code(400).send({
+        error: 'sourceProjectId and sourceMainFile must be provided together, or both omitted.',
+      });
+    }
+
+    // Validate template
+    const { templates } = await readTemplateManifest();
+    const template = templates.find(t => t.id === targetTemplateId);
+    if (!template) {
+      return reply.code(400).send({ error: `Unknown template: ${targetTemplateId}` });
+    }
+
+    // Create new project from template
+    await ensureDir(DATA_DIR);
+    const newProjectId = crypto.randomUUID();
+    const projectRoot = path.join(DATA_DIR, newProjectId);
+    await ensureDir(projectRoot);
+
+    let sourceName = 'Untitled';
+    if (sourceProjectId) {
+      try {
+        const srcMeta = await readJson(path.join(DATA_DIR, sourceProjectId, 'project.json'));
+        sourceName = srcMeta.name || 'Untitled';
+      } catch { /* ignore */ }
+    }
+
+    const meta = {
+      id: newProjectId,
+      name: `${sourceName} (${template.label})`,
+      createdAt: new Date().toISOString(),
+    };
+    await writeJson(path.join(projectRoot, 'project.json'), meta);
+
+    const templateRoot = path.join(TEMPLATE_DIR, targetTemplateId);
+    await copyDir(templateRoot, projectRoot);
+
+    // Build MinerU transfer graph
+    const jobId = crypto.randomUUID();
+    const graph = buildMineruTransferGraph();
+
+    const initialState = {
+      sourceProjectId: sourceProjectId || '',
+      sourceMainFile: sourceMainFile || '',
+      targetProjectId: newProjectId,
+      targetMainFile,
+      engine,
+      layoutCheck,
+      llmConfig: resolveLLMConfig(llmConfig),
+      mineruConfig: resolveMineruConfig(mineruConfig),
+      transferMode: 'mineru',
+      jobId,
+    };
+
+    jobs.set(jobId, {
+      graph,
+      state: initialState,
+      status: 'pending',
+      progressLog: [],
+      hasStarted: false,
+      iterator: null,
+    });
+
+    return { jobId, newProjectId };
+  });
+
+  /**
+   * POST /api/transfer/upload-pdf
+   * Multipart: { jobId, pdf: File }
+   * Upload a PDF for MinerU-based transfer (when no source project).
+   */
+  fastify.post('/api/transfer/upload-pdf', async (request, reply) => {
+    const parts = request.parts();
+    let jobId = '';
+    let pdfBuffer = null;
+
+    for await (const part of parts) {
+      if (part.fieldname === 'jobId' && part.type === 'field') {
+        jobId = part.value;
+      } else if (part.fieldname === 'pdf' && part.type === 'file') {
+        const chunks = [];
+        for await (const chunk of part.file) {
+          chunks.push(chunk);
+        }
+        pdfBuffer = Buffer.concat(chunks);
+      }
+    }
+
+    if (!jobId) {
+      return reply.code(400).send({ error: 'Missing jobId.' });
+    }
+
+    const job = jobs.get(jobId);
+    if (!job) {
+      return reply.code(404).send({ error: 'Job not found.' });
+    }
+    if (job.state?.transferMode !== 'mineru') {
+      return reply.code(400).send({ error: 'Job is not a MinerU transfer job.' });
+    }
+
+    if (!pdfBuffer) {
+      return reply.code(400).send({ error: 'No PDF file uploaded.' });
+    }
+
+    // Save PDF to target project directory
+    const pdfPath = path.join(job.state.targetProjectId
+      ? path.join(DATA_DIR, job.state.targetProjectId)
+      : DATA_DIR, '_uploaded_source.pdf');
+    await ensureDir(path.dirname(pdfPath));
+    await fs.writeFile(pdfPath, pdfBuffer);
+
+    // Set sourcePdfPath in state so compileSource skips compilation
+    job.state.sourcePdfPath = pdfPath;
+
+    return { ok: true, pdfPath };
   });
 
 } // end registerTransferRoutes

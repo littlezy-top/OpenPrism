@@ -4,6 +4,8 @@ import {
   transferStart,
   transferStep,
   transferSubmitImages,
+  mineruTransferStart,
+  mineruTransferUploadPdf,
   listTemplates,
   getProjectTree,
 } from '../api/client';
@@ -18,10 +20,18 @@ interface TransferPanelProps {
   onJobUpdate?: (job: { jobId: string; status: string; progressLog: string[]; error?: string }) => void;
 }
 
+type TransferMode = 'legacy' | 'mineru';
+type MineruSource = 'project' | 'upload';
+
 const ENGINES = ['pdflatex', 'xelatex', 'lualatex', 'latexmk'] as const;
 
 export default function TransferPanel({ projectId, onJobUpdate }: TransferPanelProps) {
   const { t } = useTranslation();
+
+  // Transfer mode
+  const [transferMode, setTransferMode] = useState<TransferMode>('mineru');
+  const [mineruSource, setMineruSource] = useState<MineruSource>('project');
+  const [uploadedPdf, setUploadedPdf] = useState<File | null>(null);
 
   // Source file selection
   const [sourceFiles, setSourceFiles] = useState<string[]>([]);
@@ -44,9 +54,36 @@ export default function TransferPanel({ projectId, onJobUpdate }: TransferPanelP
     } catch { return { llmEndpoint: '', llmApiKey: '', llmModel: '' }; }
   };
 
+  const readMineruConfigFromStorage = (): { mineruApiBase: string; mineruToken: string } => {
+    try {
+      const raw = window.localStorage.getItem(SETTINGS_KEY);
+      if (!raw) return { mineruApiBase: '', mineruToken: '' };
+      const p = JSON.parse(raw);
+      return {
+        mineruApiBase: p.mineruApiBase || '',
+        mineruToken: p.mineruToken || '',
+      };
+    } catch { return { mineruApiBase: '', mineruToken: '' }; }
+  };
+
+  const saveMineruConfigToStorage = (apiBase: string, token: string) => {
+    try {
+      const raw = window.localStorage.getItem(SETTINGS_KEY);
+      const p = raw ? JSON.parse(raw) : {};
+      p.mineruApiBase = apiBase;
+      p.mineruToken = token;
+      window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(p));
+    } catch { /* ignore */ }
+  };
+
+  // MinerU API config — initialized from localStorage
+  const [mineruApiBase, setMineruApiBase] = useState(() => readMineruConfigFromStorage().mineruApiBase);
+  const [mineruToken, setMineruToken] = useState(() => readMineruConfigFromStorage().mineruToken);
+
   // Dropdown open states
   const [templateDropdownOpen, setTemplateDropdownOpen] = useState(false);
   const [engineDropdownOpen, setEngineDropdownOpen] = useState(false);
+  const [modeDropdownOpen, setModeDropdownOpen] = useState(false);
 
   // Job state
   const [jobId, setJobId] = useState('');
@@ -63,6 +100,8 @@ export default function TransferPanel({ projectId, onJobUpdate }: TransferPanelP
   const sourceRef = useRef<HTMLDivElement>(null);
   const templateRef = useRef<HTMLDivElement>(null);
   const engineRef = useRef<HTMLDivElement>(null);
+  const modeRef = useRef<HTMLDivElement>(null);
+  const pdfInputRef = useRef<HTMLInputElement>(null);
 
   // Load source .tex files on mount
   useEffect(() => {
@@ -98,6 +137,7 @@ export default function TransferPanel({ projectId, onJobUpdate }: TransferPanelP
       if (sourceRef.current && !sourceRef.current.contains(e.target as Node)) setSourceDropdownOpen(false);
       if (templateRef.current && !templateRef.current.contains(e.target as Node)) setTemplateDropdownOpen(false);
       if (engineRef.current && !engineRef.current.contains(e.target as Node)) setEngineDropdownOpen(false);
+      if (modeRef.current && !modeRef.current.contains(e.target as Node)) setModeDropdownOpen(false);
     };
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
@@ -117,7 +157,7 @@ export default function TransferPanel({ projectId, onJobUpdate }: TransferPanelP
   };
 
   const handleStart = useCallback(async () => {
-    if (!targetTemplateId || !sourceMainFile) return;
+    if (!targetTemplateId) return;
     const targetMainFile = selectedTemplate?.mainFile || 'main.tex';
     setError('');
     setProgressLog([]);
@@ -125,24 +165,58 @@ export default function TransferPanel({ projectId, onJobUpdate }: TransferPanelP
     setStatus('starting');
 
     try {
-      const res = await transferStart({
-        sourceProjectId: projectId,
-        sourceMainFile,
-        targetTemplateId,
-        targetMainFile,
-        engine,
-        layoutCheck,
-        llmConfig: buildLlmConfig(),
-      });
-      setJobId(res.jobId);
-      setStatus('started');
-      await runGraph(res.jobId);
+      if (transferMode === 'mineru') {
+        // MinerU mode — persist config to localStorage
+        saveMineruConfigToStorage(mineruApiBase, mineruToken);
+        const mineruConfig = (mineruApiBase || mineruToken)
+          ? {
+            ...(mineruApiBase ? { apiBase: mineruApiBase } : {}),
+            ...(mineruToken ? { token: mineruToken } : {}),
+          }
+          : undefined;
+
+        const res = await mineruTransferStart({
+          sourceProjectId: mineruSource === 'project' ? projectId : undefined,
+          sourceMainFile: mineruSource === 'project' ? sourceMainFile : undefined,
+          targetTemplateId,
+          targetMainFile,
+          engine,
+          layoutCheck,
+          llmConfig: buildLlmConfig(),
+          mineruConfig,
+        });
+        setJobId(res.jobId);
+
+        // If uploading PDF, upload it before running graph
+        if (mineruSource === 'upload' && uploadedPdf) {
+          setStatus('uploading_pdf');
+          await mineruTransferUploadPdf(res.jobId, uploadedPdf);
+        }
+
+        setStatus('started');
+        await runGraph(res.jobId);
+      } else {
+        // Legacy mode
+        if (!sourceMainFile) return;
+        const res = await transferStart({
+          sourceProjectId: projectId,
+          sourceMainFile,
+          targetTemplateId,
+          targetMainFile,
+          engine,
+          layoutCheck,
+          llmConfig: buildLlmConfig(),
+        });
+        setJobId(res.jobId);
+        setStatus('started');
+        await runGraph(res.jobId);
+      }
     } catch (err: any) {
       setError(err.message || 'Failed to start transfer');
       setRunning(false);
       setStatus('error');
     }
-  }, [targetTemplateId, sourceMainFile, projectId, engine, layoutCheck, selectedTemplate]);
+  }, [transferMode, mineruSource, uploadedPdf, targetTemplateId, sourceMainFile, projectId, engine, layoutCheck, selectedTemplate, mineruApiBase, mineruToken]);
 
   const runGraph = useCallback(async (jid: string) => {
     // eslint-disable-next-line no-constant-condition
@@ -181,37 +255,126 @@ export default function TransferPanel({ projectId, onJobUpdate }: TransferPanelP
     </svg>
   );
 
+  const modeLabel = transferMode === 'mineru' ? 'MinerU (PDF→MD→LaTeX)' : t('经典模式 (LaTeX→LaTeX)');
+
+  const canStart = (() => {
+    if (running || !targetTemplateId) return false;
+    if (transferMode === 'legacy') return !!sourceMainFile;
+    if (transferMode === 'mineru') {
+      if (mineruSource === 'project') return !!sourceMainFile;
+      if (mineruSource === 'upload') return !!uploadedPdf;
+    }
+    return false;
+  })();
+
   return (
     <div className="transfer-panel">
-      {/* Source file selection */}
+      {/* Transfer mode selection */}
       <div className="field">
-        <label>{t('源文件')}</label>
-        <div className="ios-select-wrapper" ref={sourceRef}>
-          <button className="ios-select-trigger" onClick={() => setSourceDropdownOpen(!sourceDropdownOpen)}>
-            <span>{sourceMainFile || t('选择源文件...')}</span>
-            {chevronSvg(sourceDropdownOpen)}
+        <label>{t('转换模式')}</label>
+        <div className="ios-select-wrapper" ref={modeRef}>
+          <button className="ios-select-trigger" onClick={() => setModeDropdownOpen(!modeDropdownOpen)}>
+            <span>{modeLabel}</span>
+            {chevronSvg(modeDropdownOpen)}
           </button>
-          {sourceDropdownOpen && (
+          {modeDropdownOpen && (
             <div className="ios-dropdown dropdown-down">
-              {sourceFiles.map(f => (
-                <div
-                  key={f}
-                  className={`ios-dropdown-item ${sourceMainFile === f ? 'active' : ''}`}
-                  onClick={() => { setSourceMainFile(f); setSourceDropdownOpen(false); }}
-                >
-                  {f}
-                  {sourceMainFile === f && checkSvg}
-                </div>
-              ))}
-              {sourceFiles.length === 0 && (
-                <div className="ios-dropdown-item" style={{ color: 'var(--muted)', pointerEvents: 'none' }}>
-                  {t('未找到 .tex 文件')}
-                </div>
-              )}
+              <div
+                className={`ios-dropdown-item ${transferMode === 'mineru' ? 'active' : ''}`}
+                onClick={() => { setTransferMode('mineru'); setModeDropdownOpen(false); }}
+              >
+                MinerU (PDF→MD→LaTeX)
+                {transferMode === 'mineru' && checkSvg}
+              </div>
+              <div
+                className={`ios-dropdown-item ${transferMode === 'legacy' ? 'active' : ''}`}
+                onClick={() => { setTransferMode('legacy'); setModeDropdownOpen(false); }}
+              >
+                {t('经典模式 (LaTeX→LaTeX)')}
+                {transferMode === 'legacy' && checkSvg}
+              </div>
             </div>
           )}
         </div>
       </div>
+      {/* MinerU mode: source selection (project or upload) */}
+      {transferMode === 'mineru' && (
+        <div className="field">
+          <label>{t('输入来源')}</label>
+          <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+            <button
+              className={`btn ${mineruSource === 'project' ? 'primary' : ''}`}
+              style={{ flex: 1, fontSize: 12 }}
+              onClick={() => setMineruSource('project')}
+            >
+              {t('从当前项目编译')}
+            </button>
+            <button
+              className={`btn ${mineruSource === 'upload' ? 'primary' : ''}`}
+              style={{ flex: 1, fontSize: 12 }}
+              onClick={() => setMineruSource('upload')}
+            >
+              {t('上传 PDF')}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Source file selection — shown for legacy mode or MinerU project mode */}
+      {(transferMode === 'legacy' || (transferMode === 'mineru' && mineruSource === 'project')) && (
+        <div className="field">
+          <label>{t('源文件')}</label>
+          <div className="ios-select-wrapper" ref={sourceRef}>
+            <button className="ios-select-trigger" onClick={() => setSourceDropdownOpen(!sourceDropdownOpen)}>
+              <span>{sourceMainFile || t('选择源文件...')}</span>
+              {chevronSvg(sourceDropdownOpen)}
+            </button>
+            {sourceDropdownOpen && (
+              <div className="ios-dropdown dropdown-down">
+                {sourceFiles.map(f => (
+                  <div
+                    key={f}
+                    className={`ios-dropdown-item ${sourceMainFile === f ? 'active' : ''}`}
+                    onClick={() => { setSourceMainFile(f); setSourceDropdownOpen(false); }}
+                  >
+                    {f}
+                    {sourceMainFile === f && checkSvg}
+                  </div>
+                ))}
+                {sourceFiles.length === 0 && (
+                  <div className="ios-dropdown-item" style={{ color: 'var(--muted)', pointerEvents: 'none' }}>
+                    {t('未找到 .tex 文件')}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* PDF upload — shown for MinerU upload mode */}
+      {transferMode === 'mineru' && mineruSource === 'upload' && (
+        <div className="field">
+          <label>{t('上传 PDF 文件')}</label>
+          <input
+            ref={pdfInputRef}
+            type="file"
+            accept=".pdf"
+            style={{ display: 'none' }}
+            onChange={e => {
+              const file = e.target.files?.[0];
+              if (file) setUploadedPdf(file);
+            }}
+          />
+          <button
+            className="btn"
+            style={{ width: '100%', fontSize: 12, marginBottom: 4 }}
+            onClick={() => pdfInputRef.current?.click()}
+          >
+            {uploadedPdf ? uploadedPdf.name : t('选择 PDF 文件...')}
+          </button>
+        </div>
+      )}
 
       {/* Target template selection */}
       <div className="field">
@@ -274,13 +437,45 @@ export default function TransferPanel({ projectId, onJobUpdate }: TransferPanelP
         {t('启用排版检查 (VLM)')}
       </label>
 
+      {/* MinerU API config — shown only in MinerU mode */}
+      {transferMode === 'mineru' && (
+        <div style={{ marginBottom: 12 }}>
+          <div className="field">
+            <label>MinerU API</label>
+            <div className="ios-select-wrapper">
+              <input
+                type="text"
+                className="ios-select-trigger"
+                placeholder="https://mineru.net/api/v4"
+                value={mineruApiBase}
+                onChange={e => setMineruApiBase(e.target.value)}
+                style={{ paddingRight: 12 }}
+              />
+            </div>
+          </div>
+          <div className="field">
+            <label>MinerU Token</label>
+            <div className="ios-select-wrapper">
+              <input
+                type="password"
+                className="ios-select-trigger"
+                placeholder={t('输入 MinerU API Token...')}
+                value={mineruToken}
+                onChange={e => setMineruToken(e.target.value)}
+                style={{ paddingRight: 12 }}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* LLM Config — managed in header settings */}
 
       {/* Start button */}
       <button
         className="btn primary"
         style={{ width: '100%', marginBottom: 12 }}
-        disabled={running || !targetTemplateId || !sourceMainFile}
+        disabled={!canStart}
         onClick={handleStart}
       >
         {running ? t('转换中...') : t('开始转换')}

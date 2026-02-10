@@ -1,8 +1,8 @@
 import { StateGraph, END, MemorySaver } from '@langchain/langgraph';
 import { TransferState } from './state.js';
-import { analyzeSource } from './nodes/analyzeSource.js';
+import { compileSource } from './nodes/compileSource.js';
+import { parsePdfWithMineru } from './nodes/parsePdfWithMineru.js';
 import { analyzeTarget } from './nodes/analyzeTarget.js';
-import { draftPlan } from './nodes/draftPlan.js';
 import { applyTransfer } from './nodes/applyTransfer.js';
 import { copyAssets } from './nodes/copyAssets.js';
 import { compile } from './nodes/compile.js';
@@ -17,13 +17,11 @@ import { finalize } from './nodes/finalize.js';
  */
 function afterCompile(state) {
   if (state.compileResult?.ok) {
-    // Compile succeeded
     if (state.layoutCheck) {
       return 'requestPageImages';
     }
     return 'finalize';
   }
-  // Compile failed
   if (state.compileAttempt < state.maxCompileLoops) {
     return 'fixCompile';
   }
@@ -44,15 +42,20 @@ function afterLayoutCheck(state) {
 }
 
 /**
- * Build and compile the LangGraph transfer workflow.
+ * Build the MinerU-based transfer workflow.
+ *
+ * Flow:
+ *   compileSource → parsePdfWithMineru → analyzeTarget → applyTransfer
+ *     → copyAssets → compile → [fixCompile loop]
+ *     → [requestPageImages → checkLayout → fixLayout loop] → finalize
  */
-export function buildTransferGraph() {
+export function buildMineruTransferGraph() {
   const graph = new StateGraph(TransferState);
 
   // Add all nodes
-  graph.addNode('analyzeSource', analyzeSource);
+  graph.addNode('compileSource', compileSource);
+  graph.addNode('parsePdfWithMineru', parsePdfWithMineru);
   graph.addNode('analyzeTarget', analyzeTarget);
-  graph.addNode('draftPlan', draftPlan);
   graph.addNode('applyTransfer', applyTransfer);
   graph.addNode('copyAssets', copyAssets);
   graph.addNode('compile', compile);
@@ -63,16 +66,16 @@ export function buildTransferGraph() {
   graph.addNode('finalize', finalize);
 
   // Set entry point
-  graph.setEntryPoint('analyzeSource');
+  graph.setEntryPoint('compileSource');
 
-  // Linear edges: analyzeSource → analyzeTarget → draftPlan → applyTransfer → copyAssets → compile
-  graph.addEdge('analyzeSource', 'analyzeTarget');
-  graph.addEdge('analyzeTarget', 'draftPlan');
-  graph.addEdge('draftPlan', 'applyTransfer');
+  // Linear edges
+  graph.addEdge('compileSource', 'parsePdfWithMineru');
+  graph.addEdge('parsePdfWithMineru', 'analyzeTarget');
+  graph.addEdge('analyzeTarget', 'applyTransfer');
   graph.addEdge('applyTransfer', 'copyAssets');
   graph.addEdge('copyAssets', 'compile');
 
-  // Conditional: after compile → fixCompile / requestPageImages / finalize
+  // Conditional: after compile
   graph.addConditionalEdges('compile', afterCompile, {
     fixCompile: 'fixCompile',
     requestPageImages: 'requestPageImages',
@@ -82,10 +85,10 @@ export function buildTransferGraph() {
   // fixCompile loops back to compile
   graph.addEdge('fixCompile', 'compile');
 
-  // requestPageImages → checkLayout (graph pauses here for frontend input)
+  // requestPageImages → checkLayout
   graph.addEdge('requestPageImages', 'checkLayout');
 
-  // Conditional: after layout check → fixLayout / finalize
+  // Conditional: after layout check
   graph.addConditionalEdges('checkLayout', afterLayoutCheck, {
     fixLayout: 'fixLayout',
     finalize: 'finalize',

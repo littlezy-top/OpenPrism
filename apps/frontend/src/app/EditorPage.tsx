@@ -7,7 +7,7 @@ import remarkGfm from 'remark-gfm';
 import { basicSetup } from 'codemirror';
 import { latex } from '../latex/lang';
 import { Compartment, EditorState, StateEffect, StateField } from '@codemirror/state';
-import { Decoration, EditorView, DecorationSet, WidgetType, keymap } from '@codemirror/view';
+import { Decoration, EditorView, DecorationSet, WidgetType, keymap, gutter, GutterMarker } from '@codemirror/view';
 import { search, searchKeymap } from '@codemirror/search';
 import { autocompletion, CompletionContext } from '@codemirror/autocomplete';
 import { toggleComment } from '@codemirror/commands';
@@ -748,6 +748,71 @@ const ghostField = StateField.define<DecorationSet>({
   provide: (field) => EditorView.decorations.from(field)
 });
 
+/* ── LaTeX environment scope colorization ── */
+const SCOPE_COLORS = [
+  'rgba(180, 74, 47, 0.5)',
+  'rgba(59, 130, 186, 0.5)',
+  'rgba(76, 159, 88, 0.5)',
+  'rgba(180, 137, 47, 0.5)',
+  'rgba(142, 68, 173, 0.5)',
+  'rgba(211, 84, 0, 0.5)',
+];
+
+function computeEnvDepths(doc: { lines: number; line: (n: number) => { text: string } }): number[] {
+  const depths: number[] = [];
+  let depth = 0;
+  for (let i = 1; i <= doc.lines; i++) {
+    const clean = stripLatexComment(doc.line(i).text);
+    ENV_RE.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    const events: { pos: number; delta: number }[] = [];
+    while ((match = ENV_RE.exec(clean)) !== null) {
+      events.push({ pos: match.index, delta: match[1] === 'begin' ? 1 : -1 });
+    }
+    events.sort((a, b) => a.pos - b.pos);
+    let lineDepth = depth;
+    for (const ev of events) {
+      if (ev.delta < 0) { depth--; lineDepth = Math.min(lineDepth, depth); }
+      else { depth++; }
+    }
+    depths.push(Math.max(0, lineDepth));
+  }
+  return depths;
+}
+
+const envDepthField = StateField.define<number[]>({
+  create(state) { return computeEnvDepths(state.doc); },
+  update(value, tr) {
+    if (tr.docChanged) return computeEnvDepths(tr.state.doc);
+    return value;
+  },
+});
+
+class ScopeMarker extends GutterMarker {
+  constructor(readonly depth: number) { super(); }
+  toDOM() {
+    const wrap = document.createElement('div');
+    wrap.className = 'cm-scope-marker';
+    for (let i = 0; i < this.depth; i++) {
+      const bar = document.createElement('span');
+      bar.className = 'cm-scope-bar';
+      bar.style.backgroundColor = SCOPE_COLORS[i % SCOPE_COLORS.length];
+      wrap.appendChild(bar);
+    }
+    return wrap;
+  }
+}
+
+const scopeGutter = gutter({
+  class: 'cm-scope-gutter',
+  lineMarker(view, line) {
+    const depths = view.state.field(envDepthField);
+    const lineNo = view.state.doc.lineAt(line.from).number;
+    const d = depths[lineNo - 1] || 0;
+    return d > 0 ? new ScopeMarker(d) : null;
+  },
+});
+
 const editorTheme = EditorView.theme(
   {
     '&': {
@@ -1215,7 +1280,7 @@ export default function EditorPage() {
   const [dragOverKind, setDragOverKind] = useState<'file' | 'folder' | ''>('');
   const [draggingPath, setDraggingPath] = useState('');
   const [dragHint, setDragHint] = useState<{ text: string; x: number; y: number } | null>(null);
-  const [mainFile, setMainFile] = useState('main.tex');
+  const [mainFile, setMainFile] = useState('');
   const [fileFilter, setFileFilter] = useState('');
   const [inlineEdit, setInlineEdit] = useState<InlineEdit | null>(null);
   const [fileContextMenu, setFileContextMenu] = useState<{ x: number; y: number } | null>(null);
@@ -1335,9 +1400,8 @@ export default function EditorPage() {
   }, [collabName]);
 
   useEffect(() => {
-    collabActiveRef.current = collabEnabled;
-    if (collabEnabled) {
-      setIsDirty(false);
+    if (!collabEnabled) {
+      collabActiveRef.current = false;
     }
   }, [collabEnabled]);
 
@@ -1394,6 +1458,7 @@ export default function EditorPage() {
     const view = cmViewRef.current;
     if (!view) return;
     if (!collabEnabled || !projectId || !activePath) {
+      collabActiveRef.current = false;
       if (collabProviderRef.current) {
         collabProviderRef.current.disconnect();
         collabProviderRef.current = null;
@@ -1405,16 +1470,26 @@ export default function EditorPage() {
       return;
     }
     if (!isTextPath(activePath)) {
+      collabActiveRef.current = false;
       if (collabProviderRef.current) {
         collabProviderRef.current.disconnect();
         collabProviderRef.current = null;
       }
       collabDocRef.current = null;
       view.dispatch({ effects: collabCompartment.reconfigure([]) });
+      setCollabStatus('disconnected');
       setCollabPeers([]);
       setStatus(t('协作暂不支持该文件类型。'));
       return;
     }
+    const currentDoc = view.state.doc.toString();
+    if (currentDoc.length > 0) {
+      suppressDirtyRef.current = true;
+      view.dispatch({ changes: { from: 0, to: currentDoc.length, insert: '' } });
+    }
+    setEditorValue('');
+    setIsDirty(false);
+
     const ydoc = new Y.Doc();
     const ytext = ydoc.getText('content');
     const awareness = new Awareness(ydoc);
@@ -1432,10 +1507,11 @@ export default function EditorPage() {
       onStatus: setCollabStatus,
       onError: (error) => setStatus(t('协作连接失败: {{error}}', { error }))
     });
-    provider.connect();
     collabProviderRef.current = provider;
     collabDocRef.current = { doc: ydoc, text: ytext, awareness };
     view.dispatch({ effects: collabCompartment.reconfigure(yCollab(ytext, awareness)) });
+    collabActiveRef.current = true;
+    provider.connect();
 
     const updatePeers = () => {
       const peers: { id: number; name: string; color: string }[] = [];
@@ -1454,6 +1530,7 @@ export default function EditorPage() {
     updatePeers();
 
     return () => {
+      collabActiveRef.current = false;
       awareness.off('update', updatePeers);
       provider.disconnect();
       collabProviderRef.current = null;
@@ -1527,14 +1604,15 @@ export default function EditorPage() {
       const skipClear = applyingSuggestionRef.current;
       if (update.docChanged) {
         const value = update.state.doc.toString();
+        const programmatic = suppressDirtyRef.current;
         setEditorValue(value);
-        if (!suppressDirtyRef.current && !collabActiveRef.current) {
+        if (!programmatic && !collabActiveRef.current) {
           setIsDirty(true);
         } else {
           suppressDirtyRef.current = false;
         }
         const path = activePathRef.current;
-        if (path) {
+        if (path && (!programmatic || collabActiveRef.current)) {
           setFiles((prev) => ({ ...prev, [path]: value }));
         }
       }
@@ -1621,6 +1699,8 @@ export default function EditorPage() {
       extensions: [
         basicSetup,
         latex(),
+        envDepthField,
+        scopeGutter,
         indentOnInput(),
         foldService.of(latexFoldService),
         EditorView.lineWrapping,
@@ -1675,16 +1755,22 @@ export default function EditorPage() {
     }
     if (Object.prototype.hasOwnProperty.call(files, filePath)) {
       const cached = files[filePath] ?? '';
-      setEditorValue(cached);
+      const collabTextFile = collabEnabled && isTextPath(filePath);
+      setEditorValue(collabTextFile ? '' : cached);
       setIsDirty(false);
-      setEditorDoc(cached);
+      if (!collabTextFile) {
+        setEditorDoc(cached);
+      }
       return cached;
     }
     const data = await getFile(projectId, filePath);
     setFiles((prev) => ({ ...prev, [filePath]: data.content }));
-    setEditorValue(data.content);
+    const collabTextFile = collabEnabled && isTextPath(filePath);
+    setEditorValue(collabTextFile ? '' : data.content);
     setIsDirty(false);
-    setEditorDoc(data.content);
+    if (!collabTextFile) {
+      setEditorDoc(data.content);
+    }
     return data.content;
   };
 
@@ -1901,9 +1987,11 @@ export default function EditorPage() {
   const writeFileCompat = useCallback(
     async (path: string, content: string) => {
       if (collabActiveRef.current && collabDocRef.current && path === activePath) {
-        const { text } = collabDocRef.current;
-        text.delete(0, text.length);
-        text.insert(0, content);
+        const { doc, text } = collabDocRef.current;
+        doc.transact(() => {
+          text.delete(0, text.length);
+          text.insert(0, content);
+        });
         setIsDirty(false);
         return { ok: true };
       }
@@ -1918,8 +2006,9 @@ export default function EditorPage() {
 
   useEffect(() => {
     if (!cmViewRef.current) return;
+    if (collabActiveRef.current || collabEnabled) return;
     setEditorDoc(editorValue);
-  }, [editorValue, setEditorDoc]);
+  }, [editorValue, setEditorDoc, collabEnabled]);
 
   useEffect(() => {
     if (collabActiveRef.current) return;
@@ -2200,7 +2289,9 @@ export default function EditorPage() {
       setFiles((prev) => ({ ...prev, [targetBib]: content }));
       if (activePath === targetBib) {
         setEditorValue(content);
-        setEditorDoc(content);
+        if (!collabActiveRef.current) {
+          setEditorDoc(content);
+        }
       }
       if (autoInsertCite && keys.length > 0) {
         if (activePath && activePath.toLowerCase().endsWith('.tex')) {
@@ -2535,7 +2626,9 @@ export default function EditorPage() {
       setFiles((prev) => ({ ...prev, [targetFile]: nextContent }));
       if (activePath === targetFile) {
         setEditorValue(nextContent);
-        setEditorDoc(nextContent);
+        if (!collabActiveRef.current) {
+          setEditorDoc(nextContent);
+        }
       }
       appendLog(setWebsearchLog, t('段落已插入 {{path}}', { path: targetFile }));
     } else if (activePath && activePath.toLowerCase().endsWith('.tex')) {
@@ -3482,7 +3575,7 @@ export default function EditorPage() {
     for (const item of list) {
       await writeFileCompat(item.filePath, item.proposed);
       setFiles((prev) => ({ ...prev, [item.filePath]: item.proposed }));
-      if (activePath === item.filePath) {
+      if (activePath === item.filePath && !collabActiveRef.current) {
         setEditorDoc(item.proposed);
       }
     }
@@ -3964,7 +4057,7 @@ export default function EditorPage() {
                   ))}
                 </div>
                 <div className="chat-controls">
-                  <div className="row">
+                  <div className="row chat-control-row">
                     {assistantMode === 'agent' ? (
                       <>
                         <div className="ios-select-wrapper">
@@ -4002,7 +4095,7 @@ export default function EditorPage() {
                             </div>
                           )}
                         </div>
-                        <div style={{ position: 'relative', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                        <div className="agent-mode-wrap">
                           <div className="ios-select-wrapper">
                             <button
                               className="ios-select-trigger"
@@ -4064,7 +4157,7 @@ export default function EditorPage() {
                     )}
                   </div>
                   {assistantMode === 'agent' && task === 'translate' && (
-                    <div className="row">
+                    <div className="row chat-control-row">
                       <div className="ios-select-wrapper">
                         <button
                           className="ios-select-trigger"

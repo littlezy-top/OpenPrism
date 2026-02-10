@@ -1,7 +1,7 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import { safeJoin } from '../../../utils/pathUtils.js';
-import { ensureDir } from '../../../utils/fsUtils.js';
+import { ensureDir, listFilesRecursive } from '../../../utils/fsUtils.js';
 
 /**
  * Check if a file exists at the given absolute path.
@@ -38,26 +38,22 @@ async function copySingleAsset(srcRoot, destRoot, relPath) {
 }
 
 /**
- * copyAssets node — copies bib files, images, and style files
- * from source project to target project.
+ * Legacy mode: copy bib files, images, and style files from source project.
  */
-export async function copyAssets(state) {
+async function copyAssetsLegacy(state) {
   const assets = state.sourceAssets || {};
   const results = [];
 
-  // Copy bib files
   for (const bib of (assets.bib || [])) {
     const r = await copySingleAsset(state.sourceProjectRoot, state.targetProjectRoot, bib);
     results.push(r);
   }
 
-  // Copy images
   for (const img of (assets.images || [])) {
     const r = await copySingleAsset(state.sourceProjectRoot, state.targetProjectRoot, img);
     results.push(r);
   }
 
-  // Copy style files (only if target doesn't have them)
   for (const sty of (assets.styles || [])) {
     const destAbs = safeJoin(state.targetProjectRoot, sty);
     if (!(await fileExists(destAbs))) {
@@ -73,4 +69,58 @@ export async function copyAssets(state) {
   return {
     progressLog: `[copyAssets] Copied ${copied} files, ${conflicts} conflicts (relocated), ${missing} missing.`,
   };
+}
+
+/**
+ * MinerU mode: copy MinerU-extracted images to target project images/ dir,
+ * and optionally copy bib files from source project if available.
+ */
+async function copyAssetsMineru(state) {
+  const images = state.sourceImages || [];
+  let copiedCount = 0;
+
+  // Copy MinerU-extracted images to target project images/
+  const imagesDir = path.join(state.targetProjectRoot, 'images');
+  await ensureDir(imagesDir);
+
+  for (const img of images) {
+    const destPath = path.join(imagesDir, img.name);
+    if (await fileExists(img.localPath)) {
+      await fs.copyFile(img.localPath, destPath);
+      copiedCount++;
+    }
+  }
+
+  // Copy bib files from source project if available
+  let bibCount = 0;
+  if (state.sourceProjectRoot) {
+    let bibCandidates = state.sourceAssets?.bib || [];
+    if (!bibCandidates.length) {
+      const allFiles = await listFilesRecursive(state.sourceProjectRoot);
+      bibCandidates = allFiles
+        .filter(f => f.type === 'file' && path.extname(f.path).toLowerCase() === '.bib')
+        .map(f => f.path);
+    }
+
+    for (const bib of [...new Set(bibCandidates)]) {
+      const r = await copySingleAsset(
+        state.sourceProjectRoot, state.targetProjectRoot, bib
+      );
+      if (r.status === 'copied') bibCount++;
+    }
+  }
+
+  return {
+    progressLog: `[copyAssets:mineru] Copied ${copiedCount} images, ${bibCount} bib files.`,
+  };
+}
+
+/**
+ * copyAssets node — dispatches to legacy or MinerU mode.
+ */
+export async function copyAssets(state) {
+  if (state.transferMode === 'mineru') {
+    return copyAssetsMineru(state);
+  }
+  return copyAssetsLegacy(state);
 }

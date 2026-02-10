@@ -25,7 +25,7 @@ const fastify = Fastify({ logger: true });
 await fastify.register(cors, { origin: true });
 await fastify.register(multipart, {
   limits: {
-    fileSize: 50 * 1024 * 1024
+    fileSize: 200 * 1024 * 1024
   }
 });
 await fastify.register(websocket);

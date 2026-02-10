@@ -2,14 +2,7 @@ import { promises as fs } from 'fs';
 import { ChatOpenAI } from '@langchain/openai';
 import { resolveLLMConfig, normalizeBaseURL } from '../../llmService.js';
 import { safeJoin } from '../../../utils/pathUtils.js';
-import { writeFileWithSnapshot } from '../utils.js';
-
-/**
- * Strip markdown code fences from LLM output.
- */
-function stripCodeFences(text) {
-  return text.replace(/^```(?:latex|tex)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
-}
+import { writeFileWithSnapshot, stripCodeFences } from '../utils.js';
 
 /**
  * fixLayout node — LLM reads current main.tex + VLM layout issues,

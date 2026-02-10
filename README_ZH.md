@@ -23,6 +23,10 @@
 |:---:|:---:|:---:|
 | Chat / Agent 双轨历史<br>Tools 多轮工具调用 | TexLive / Tectonic / Auto<br>PDF 预览与下载 | ACL / CVPR / NeurIPS / ICML<br>模板一键切换 |
 
+| 🔄 模板转换 | | |
+|:---:|:---:|:---:|
+| 经典模式 (LaTeX→LaTeX) / MinerU 模式 (PDF→MD→LaTeX)<br>LLM 驱动迁移 + 自动编译修复 + VLM 排版检查 | | |
+
 | 🔧 高级编辑 | 🗂️ 项目管理 | ⚙️ 灵活配置 |
 |:---:|:---:|:---:|
 | AI 自动补全 / Diff / 诊断 | 多项目管理 + 文件树 + 上传 | OpenAI 兼容端点<br>本地部署数据安全 |
@@ -51,6 +55,10 @@
 > [!WARNING]
 > 🚧 <strong>模板转换功能仍在测试中</strong><br>
 > 模板转换（Template Transfer）功能目前处于测试阶段，可能存在已知或未知的 Bug。如遇到问题，欢迎在 [Issues](https://github.com/OpenDCAI/OpenPrism/issues) 中反馈。
+
+> [!TIP]
+> 🆕 <strong>2025-02 · 模板转换（双模式）</strong><br>
+> 支持两种转换模式：经典模式（LaTeX→LaTeX 直接迁移）和 MinerU 模式（PDF→Markdown→LaTeX，通过 MinerU API 解析）。两种模式均支持 LLM 驱动的内容迁移、自动编译错误修复，以及可选的 VLM 排版检查。
 
 > [!TIP]
 > 🆕 <strong>2025-02 · 实时协作上线</strong><br>
@@ -91,6 +99,15 @@ OpenPrism 是一个面向学术写作的本地部署 LaTeX + AI 工作台，强�
 
 - **内置模板**：ACL / CVPR / NeurIPS / ICML
 - **模板转换**：一键切换模板并保留正文内容
+
+### 🔄 模板转换
+
+- **双模式**：经典模式（LaTeX→LaTeX）和 MinerU 模式（PDF→Markdown→LaTeX）
+- **MinerU 集成**：通过 MinerU API 解析 PDF，提取 Markdown + 图片，再填充到目标模板
+- **LLM 驱动迁移**：AI 分析源/目标结构，制定迁移计划，自动映射内容
+- **自动编译修复**：自动检测并修复 LaTeX 编译错误，支持重试循环
+- **VLM 排版检查**：可选的视觉排版验证，使用 VLM 检测溢出、重叠、间距等问题
+- **资源处理**：自动复制图片、bib 文件和样式文件到目标项目
 
 ### 🗂️ 项目管理
 
@@ -445,6 +462,10 @@ OPENPRISM_DATA_DIR=./data
 
 # 后端服务端口
 PORT=8787
+
+# MinerU API 配置（用于 PDF→MD→LaTeX 转换）
+OPENPRISM_MINERU_API_BASE=https://mineru.net/api/v4
+OPENPRISM_MINERU_TOKEN=your-mineru-token
 ```
 
 ### LLM 配置
@@ -623,10 +644,20 @@ OpenPrism/
 │   ├── frontend/              # React + Vite 前端
 │   │   ├── src/
 │   │   │   ├── app/App.tsx     # 主应用逻辑
+│   │   │   ├── app/TransferPanel.tsx  # 模板转换 UI
 │   │   │   ├── api/client.ts   # API 调用
 │   │   │   └── latex/          # TexLive 集成
 │   └── backend/               # Fastify 后端
-│       └── src/index.js        # API / 编译 / LLM 代理
+│       └── src/
+│           ├── index.js        # API / 编译 / LLM 代理
+│           ├── routes/transfer.js  # 转换 API 端点
+│           └── services/
+│               ├── mineruService.js        # MinerU API 集成
+│               └── transferAgent/          # LangGraph 转换工作流
+│                   ├── graph.js            # 经典转换图
+│                   ├── graphMineru.js       # MinerU 转换图
+│                   ├── state.js            # 转换状态定义
+│                   └── nodes/              # 工作流节点
 ├── templates/                 # LaTeX 模板（ACL/CVPR/NeurIPS/ICML）
 ├── data/                      # 项目存储目录（默认）
 └── README.md
@@ -658,9 +689,9 @@ OpenPrism/
 <td>增强联网检索能力，接入第三方 Search API（如 Google / Baidu / SerpAPI），提升搜索质量与覆盖范围</td>
 </tr>
 <tr>
-<td><strong>📚 会议模板一键转换</strong></td>
-<td><img src="https://img.shields.io/badge/⏳-规划中-yellow?style=flat-square" alt="Planned"/></td>
-<td>支持不同会议模板间快速转换（如 ACL → NeurIPS），方便转投，保留正文内容与格式</td>
+<td><strong>📚 模板转换（双模式）</strong></td>
+<td><img src="https://img.shields.io/badge/✅-已完成-success?style=flat-square" alt="Done"/></td>
+<td>经典模式（LaTeX→LaTeX）和 MinerU 模式（PDF→MD→LaTeX）双模式模板转换，支持 LLM 驱动迁移、自动编译修复和 VLM 排版检查</td>
 </tr>
 <tr>
 <td><strong>📸 版本快照与回滚</strong></td>

@@ -31,7 +31,7 @@ export function registerAgentRoutes(fastify) {
       const user = [
         prompt ? `User Prompt: ${prompt}` : '',
         selection ? `Selection (read-only):\n${selection}` : '',
-        content ? `Current File (read-only):\n${content}` : '',
+        selection ? '' : (content ? `Current File (read-only):\n${content}` : ''),
         compileLog ? `Compile Log (read-only):\n${compileLog}` : ''
       ].filter(Boolean).join('\n\n');
 

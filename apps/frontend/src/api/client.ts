@@ -512,3 +512,47 @@ export function transferSubmitImages(jobId: string, images: PageImage[]) {
 export function transferStatus(jobId: string) {
   return request<TransferStepResult>(`/api/transfer/status/${jobId}`);
 }
+
+// ─── MinerU Transfer API ───
+
+export interface MineruConfig {
+  apiBase?: string;
+  token?: string;
+  modelVersion?: string;
+}
+
+export interface MineruTransferStartPayload {
+  sourceProjectId?: string;
+  sourceMainFile?: string;
+  targetTemplateId: string;
+  targetMainFile: string;
+  engine?: string;
+  layoutCheck?: boolean;
+  llmConfig?: Partial<LLMConfig>;
+  mineruConfig?: MineruConfig;
+}
+
+export function mineruTransferStart(payload: MineruTransferStartPayload) {
+  return request<{ jobId: string; newProjectId: string }>(
+    '/api/transfer/start-mineru',
+    { method: 'POST', body: JSON.stringify(payload) },
+  );
+}
+
+export async function mineruTransferUploadPdf(jobId: string, pdfFile: File) {
+  const form = new FormData();
+  form.append('jobId', jobId);
+  form.append('pdf', pdfFile);
+  const res = await fetch('/api/transfer/upload-pdf', {
+    method: 'POST',
+    body: form,
+    headers: {
+      'x-lang': getLangHeader(),
+      ...getAuthHeader(),
+    },
+  });
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
+  return res.json() as Promise<{ ok: boolean; pdfPath?: string }>;
+}

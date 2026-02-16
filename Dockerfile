@@ -1,56 +1,34 @@
-# syntax=docker/dockerfile:1
+FROM texlive/texlive:latest
 
-############################
-# 1) Build stage (Node)
-############################
-FROM node:18-bullseye AS builder
 WORKDIR /app
 
-# 1) 先拷贝清单文件以利用缓存
+# 1) 装 Node / npm（单阶段里必须装）
+#    如果你的 texlive tag 不是 Debian/Ubuntu 系导致 apt-get 不存在，再告诉我你用的 tag，我给你换命令。
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+     nodejs npm ca-certificates fontconfig git \
+  && rm -rf /var/lib/apt/lists/*
+
+# 2) 先复制依赖清单以利用缓存
 COPY package.json package-lock.json ./
 COPY apps/backend/package.json apps/backend/package.json
 COPY apps/frontend/package.json apps/frontend/package.json
 
-# 2) 装全量依赖（需要 dev 依赖来 build 前端）
+# 3) 安装依赖（需要 dev 依赖来 build 前端）
 RUN npm ci
 
-# 3) 拷贝源码并构建前端
+# 4) 复制全部源码（单阶段：一锅端）
 COPY . .
+
+# 5) 构建前端（生成 apps/frontend/dist，后端会自动托管它）
 RUN npm run build
-
-# 4) 构建完成后，把 dev 依赖剔除，只保留 production node_modules
-#    （会在当前 workspace 依赖树里做 pruned）
-RUN npm prune --omit=dev
-
-
-############################
-# 2) Runtime stage (TeXLive base)
-############################
-FROM texlive/texlive:latest AS runtime
-WORKDIR /app
-
-# 安装 Node.js（用 Debian/Ubuntu 的 apt）
-# 如果你想严格锁 Node 版本（更推荐），可以改用 NodeSource；这里先给通用版。
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends \
-     nodejs npm ca-certificates fontconfig \
-  && rm -rf /var/lib/apt/lists/*
 
 ENV NODE_ENV=production
 ENV PORT=8787
 ENV OPENPRISM_DATA_DIR=/var/openprism/data
 
-# 只拷“运行必需”的内容（精简拷贝）
-COPY --from=builder /app/apps/backend/src ./apps/backend/src
-COPY --from=builder /app/apps/backend/package.json ./apps/backend/package.json
-
-COPY --from=builder /app/apps/frontend/dist ./apps/frontend/dist
-
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/package.json ./package.json
-COPY --from=builder /app/package-lock.json ./package-lock.json
-
 EXPOSE 8787
 VOLUME ["/var/openprism/data"]
 
+# 6) 直接启动后端
 CMD ["node", "apps/backend/src/index.js"]
